@@ -1,0 +1,391 @@
+//Microsoft Developer Studio generated resource script.
+//
+#include "resource.h"
+
+#define APSTUDIO_READONLY_SYMBOLS
+/////////////////////////////////////////////////////////////////////////////
+//
+// Generated from the TEXTINCLUDE 2 resource.
+//
+#include "afxres.h"
+
+/////////////////////////////////////////////////////////////////////////////
+#undef APSTUDIO_READONLY_SYMBOLS
+
+/////////////////////////////////////////////////////////////////////////////
+// Chinese (P.R.C.) resources
+
+#if !defined(AFX_RESOURCE_DLL) || defined(AFX_TARG_CHS)
+#ifdef _WIN32
+LANGUAGE LANG_CHINESE, SUBLANG_CHINESE_SIMPLIFIED
+#pragma code_page(936)
+#endif //_WIN32
+
+#ifdef APSTUDIO_INVOKED
+/////////////////////////////////////////////////////////////////////////////
+//
+// TEXTINCLUDE
+//
+
+1 TEXTINCLUDE DISCARDABLE 
+BEGIN
+    "resource.h\0"
+END
+
+2 TEXTINCLUDE DISCARDABLE 
+BEGIN
+    "#include ""afxres.h""\r\n"
+    "\0"
+END
+
+3 TEXTINCLUDE DISCARDABLE 
+BEGIN
+    "#define _AFX_NO_SPLITTER_RESOURCES\r\n"
+    "#define _AFX_NO_OLE_RESOURCES\r\n"
+    "#define _AFX_NO_TRACKER_RESOURCES\r\n"
+    "#define _AFX_NO_PROPERTY_RESOURCES\r\n"
+    "\r\n"
+    "#if !defined(AFX_RESOURCE_DLL) || defined(AFX_TARG_ENU)\r\n"
+    "#ifdef _WIN32\r\n"
+    "LANGUAGE 9, 1\r\n"
+    "#pragma code_page(1252)\r\n"
+    "#endif //_WIN32\r\n"
+    "#include ""res\\RadCali.rc2""  // non-Microsoft Visual C++ edited resources\r\n"
+    "#include ""afxres.rc""         // Standard components\r\n"
+    "#endif\r\n"
+    "\0"
+END
+
+#endif    // APSTUDIO_INVOKED
+
+
+/////////////////////////////////////////////////////////////////////////////
+//
+// Dialog
+//
+
+IDD_ABOUTBOX DIALOGEX 0, 0, 277, 172
+STYLE DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "关于 ..."
+FONT 8, "MS Sans Serif", 0, 0, 0x1
+BEGIN
+    ICON            IDR_MAINFRAME,IDC_STATIC,21,10,20,20
+    LTEXT           "邮件:",IDC_STATIC,39,97,29,8
+    LTEXT           "网站:",IDC_STATIC,39,85,29,8
+    PUSHBUTTON      "确定",IDOK,218,6,47,17,BS_FLAT
+    CONTROL         "",IDC_STATIC,"Static",SS_BLACKFRAME,25,43,223,1
+    LTEXT           "客户服务信息 :",IDC_STATIC,28,48,101,8
+    LTEXT           "电话:",IDC_STATIC,39,61,29,8
+    LTEXT           "传真:",IDC_STATIC,40,73,29,8
+    EDITTEXT        IDC_EDIT_WARRING,2,113,272,44,ES_MULTILINE | 
+                    ES_AUTOVSCROLL | ES_READONLY | NOT WS_BORDER,
+                    WS_EX_STATICEDGE
+    EDITTEXT        IDC_EDIT_PATH,2,160,273,12,ES_AUTOHSCROLL | ES_READONLY | 
+                    NOT WS_BORDER
+    LTEXT           "RadCali Version 1.0",IDC_STATIC_PRODUCTNAME_VER,53,9,
+                    140,12
+    LTEXT           "版权所有 2025 武汉大学遥感院 DPGrid 课题组",
+                    IDC_STATIC_COPYRIGHT,45,30,218,10
+    LTEXT           "86-27-68778010",IDC_STATIC_TEL,71,60,161,9
+    LTEXT           "86-27-68778010",IDC_STATIC_FAX,71,73,161,9
+    LTEXT           "http://www.whudpcv.cn",IDC_STATIC_WEB,71,86,161,9
+    LTEXT           "dpgrid@whu.edu.cn",IDC_STATIC_EML,71,99,161,9
+END
+
+IDD_RADCALI_DIALOG DIALOGEX 0, 0, 422, 244
+STYLE DS_MODALFRAME | WS_MINIMIZEBOX | WS_POPUP | WS_VISIBLE | WS_CAPTION | 
+    WS_SYSMENU
+EXSTYLE WS_EX_ACCEPTFILES | WS_EX_APPWINDOW
+CAPTION "RadCali Dialog"
+FONT 8, "MS Sans Serif"
+BEGIN
+    CONTROL         "List1",IDC_LIST_CTRL,"SysListView32",LVS_REPORT | 
+                    LVS_SHOWSELALWAYS | WS_BORDER | WS_TABSTOP,4,20,413,155
+    LTEXT           "Prj",IDC_STATIC,2,4,28,9
+    EDITTEXT        IDC_EDIT_RET,33,5,347,12,ES_AUTOHSCROLL,
+                    WS_EX_ACCEPTFILES
+    PUSHBUTTON      "...",IDC_BUTTON_RET,380,4,34,12
+    LTEXT           "Ref",IDC_STATIC,4,182,28,9
+    EDITTEXT        IDC_EDIT_REF,33,182,347,12,ES_AUTOHSCROLL,
+                    WS_EX_ACCEPTFILES
+    PUSHBUTTON      "...",IDC_BUTTON_REF,380,182,34,12
+    CONTROL         "Progress1",IDC_PROGRESS_ALL,"msctls_progress32",NOT 
+                    WS_VISIBLE,3,228,263,6
+    DEFPUSHBUTTON   "OK",IDOK,332,221,36,16
+    PUSHBUTTON      "Cancel",IDCANCEL,380,221,36,16
+    CONTROL         "Progress1",IDC_PROGRESS_CUR,"msctls_progress32",NOT 
+                    WS_VISIBLE,3,234,263,6
+    LTEXT           ".",IDC_STATIC_MSG,3,214,241,11
+    PUSHBUTTON      "LoadPrj",IDC_BUTTON_LOAD,284,221,36,16
+    EDITTEXT        IDC_EDIT_GS,305,200,31,13,ES_AUTOHSCROLL
+    LTEXT           "IntSz",IDC_STATIC,272,202,27,8
+    LTEXT           "WndSz",IDC_STATIC,347,201,27,8
+    EDITTEXT        IDC_EDIT_WS,379,200,24,13,ES_AUTOHSCROLL
+    CONTROL         "MchTie",IDC_CHECK_MCH,"Button",BS_AUTOCHECKBOX | 
+                    WS_TABSTOP,159,202,46,11
+    CONTROL         "Adjust",IDC_CHECK_ADJ,"Button",BS_AUTOCHECKBOX | 
+                    WS_TABSTOP,217,202,46,11
+    LTEXT           "CPUs",IDC_STATIC,13,203,27,8
+    COMBOBOX        IDC_COMBO_CORE,46,201,39,88,CBS_DROPDOWN | WS_VSCROLL | 
+                    WS_TABSTOP
+    CONTROL         "OlpTxt",IDC_CHECK_TXT,"Button",BS_AUTOCHECKBOX | 
+                    WS_TABSTOP,104,203,40,10
+END
+
+
+/////////////////////////////////////////////////////////////////////////////
+//
+// Dialog Info
+//
+
+IDD_RADCALI_DIALOG DLGINIT
+BEGIN
+    IDC_COMBO_CORE, 0x403, 2, 0
+0x0032, 
+    IDC_COMBO_CORE, 0x403, 2, 0
+0x0034, 
+    IDC_COMBO_CORE, 0x403, 2, 0
+0x0038, 
+    IDC_COMBO_CORE, 0x403, 3, 0
+0x3631, "\000" 
+    IDC_COMBO_CORE, 0x403, 3, 0
+0x3233, "\000" 
+    IDC_COMBO_CORE, 0x403, 3, 0
+0x3834, "\000" 
+    0
+END
+
+
+/////////////////////////////////////////////////////////////////////////////
+//
+// String Table
+//
+
+STRINGTABLE DISCARDABLE 
+BEGIN
+    IDS_ABOUTBOX            "关于(&A) ..."
+END
+
+#endif    // Chinese (P.R.C.) resources
+/////////////////////////////////////////////////////////////////////////////
+
+
+/////////////////////////////////////////////////////////////////////////////
+// English (U.S.) resources
+
+#if !defined(AFX_RESOURCE_DLL) || defined(AFX_TARG_ENU)
+#ifdef _WIN32
+LANGUAGE LANG_ENGLISH, SUBLANG_ENGLISH_US
+#pragma code_page(1252)
+#endif //_WIN32
+
+/////////////////////////////////////////////////////////////////////////////
+//
+// Dialog
+//
+
+IDD_RADCALI_DIALOG DIALOGEX 0, 0, 422, 242
+STYLE DS_MODALFRAME | WS_MINIMIZEBOX | WS_POPUP | WS_VISIBLE | WS_CAPTION | 
+    WS_SYSMENU
+EXSTYLE WS_EX_ACCEPTFILES | WS_EX_APPWINDOW
+CAPTION "RadCali Dialog"
+FONT 8, "MS Sans Serif"
+BEGIN
+    CONTROL         "List1",IDC_LIST_CTRL,"SysListView32",LVS_REPORT | 
+                    LVS_SHOWSELALWAYS | WS_BORDER | WS_TABSTOP,4,20,413,155
+    CONTROL         "Progress1",IDC_PROGRESS_ALL,"msctls_progress32",NOT 
+                    WS_VISIBLE,3,228,263,6
+    DEFPUSHBUTTON   "OK",IDOK,332,221,36,16
+    PUSHBUTTON      "Cancel",IDCANCEL,380,221,36,16
+    CONTROL         "Progress1",IDC_PROGRESS_CUR,"msctls_progress32",NOT 
+                    WS_VISIBLE,3,234,263,6
+    LTEXT           ".",IDC_STATIC_MSG,3,214,241,11
+    LTEXT           "Prj",IDC_STATIC,2,4,28,9
+    EDITTEXT        IDC_EDIT_RET,33,5,347,12,ES_AUTOHSCROLL,
+                    WS_EX_ACCEPTFILES
+    PUSHBUTTON      "...",IDC_BUTTON_RET,380,4,34,12
+    LTEXT           "Ref",IDC_STATIC,4,182,28,9
+    EDITTEXT        IDC_EDIT_REF,33,182,347,12,ES_AUTOHSCROLL,
+                    WS_EX_ACCEPTFILES
+    PUSHBUTTON      "...",IDC_BUTTON_REF,380,182,34,12
+    PUSHBUTTON      "LoadPrj",IDC_BUTTON_LOAD,284,221,36,16
+    EDITTEXT        IDC_EDIT_GS,305,200,31,13,ES_AUTOHSCROLL
+    LTEXT           "IntSz",IDC_STATIC,272,202,27,8
+    LTEXT           "WndSz",IDC_STATIC,347,201,27,8
+    EDITTEXT        IDC_EDIT_WS,379,200,24,13,ES_AUTOHSCROLL
+    CONTROL         "MchTie",IDC_CHECK_MCH,"Button",BS_AUTOCHECKBOX | 
+                    WS_TABSTOP,159,202,46,11
+    CONTROL         "Adjust",IDC_CHECK_ADJ,"Button",BS_AUTOCHECKBOX | 
+                    WS_TABSTOP,217,202,46,11
+    LTEXT           "CPUs",IDC_STATIC,13,203,27,8
+    COMBOBOX        IDC_COMBO_CORE,46,201,39,88,CBS_DROPDOWN | WS_VSCROLL | 
+                    WS_TABSTOP
+    CONTROL         "OlpTxt",IDC_CHECK_TXT,"Button",BS_AUTOCHECKBOX | 
+                    WS_TABSTOP,104,203,40,10
+END
+
+IDD_ABOUTBOX DIALOGEX 0, 0, 277, 172
+STYLE DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "About ..."
+FONT 8, "MS Sans Serif", 0, 0, 0x1
+BEGIN
+    ICON            IDR_MAINFRAME,IDC_STATIC,21,10,20,20
+    LTEXT           "EMails:",IDC_STATIC,39,97,29,8
+    LTEXT           "Web:",IDC_STATIC,39,85,29,8
+    PUSHBUTTON      "OK",IDOK,207,6,47,17,BS_FLAT
+    CONTROL         "",IDC_STATIC,"Static",SS_BLACKFRAME,25,43,223,1
+    LTEXT           "Support Information :",IDC_STATIC,28,48,101,8
+    LTEXT           "Tel:",IDC_STATIC,39,61,29,8
+    LTEXT           "Fax:",IDC_STATIC,40,73,29,8
+    EDITTEXT        IDC_EDIT_WARRING,2,113,272,44,ES_MULTILINE | 
+                    ES_AUTOVSCROLL | ES_READONLY | NOT WS_BORDER,
+                    WS_EX_STATICEDGE
+    EDITTEXT        IDC_EDIT_PATH,2,160,273,12,ES_AUTOHSCROLL | ES_READONLY | 
+                    NOT WS_BORDER
+    LTEXT           "RadCali Version 1.0",IDC_STATIC_PRODUCTNAME_VER,53,9,
+                    140,12
+    LTEXT           "Copyright (C) 2025 WHU RSGIS DPGrid Group.",
+                    IDC_STATIC_COPYRIGHT,53,27,202,12
+    LTEXT           "86-27-68778010",IDC_STATIC_TEL,71,60,161,9
+    LTEXT           "86-27-68778010",IDC_STATIC_FAX,71,73,161,9
+    LTEXT           "http://www.whudpcv.cn",IDC_STATIC_WEB,71,86,161,9
+    LTEXT           "dpgrid@whu.edu.cn",IDC_STATIC_EML,71,99,161,9
+END
+
+
+/////////////////////////////////////////////////////////////////////////////
+//
+// Icon
+//
+
+// Icon with lowest ID value placed first to ensure application icon
+// remains consistent on all systems.
+IDR_MAINFRAME           ICON    DISCARDABLE     "res\\RadCali.ico"
+
+#ifndef _MAC
+/////////////////////////////////////////////////////////////////////////////
+//
+// Version
+//
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION 1,0,0,1
+ PRODUCTVERSION 1,0,0,1
+ FILEFLAGSMASK 0x3fL
+#ifdef _DEBUG
+ FILEFLAGS 0x1L
+#else
+ FILEFLAGS 0x0L
+#endif
+ FILEOS 0x4L
+ FILETYPE 0x1L
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "Comments", "\0"
+            VALUE "CompanyName", "WHU RSGIS DPGrid Group\0"
+            VALUE "FileDescription", "RadCali \0"
+            VALUE "FileVersion", "1, 0, 0, 1\0"
+            VALUE "InternalName", "RadCali\0"
+            VALUE "LegalCopyright", "Copyright (C) 2025 WHU RSGIS DPGrid Group\0"
+            VALUE "LegalTrademarks", "\0"
+            VALUE "OriginalFilename", "RadCali.EXE\0"
+            VALUE "PrivateBuild", "\0"
+            VALUE "ProductName", "RadCali \0"
+            VALUE "ProductVersion", "1, 0, 0, 1\0"
+            VALUE "SpecialBuild", "\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
+
+#endif    // !_MAC
+
+
+/////////////////////////////////////////////////////////////////////////////
+//
+// DESIGNINFO
+//
+
+#ifdef APSTUDIO_INVOKED
+GUIDELINES DESIGNINFO DISCARDABLE 
+BEGIN
+    IDD_RADCALI_DIALOG, DIALOG
+    BEGIN
+        BOTTOMMARGIN, 233
+    END
+
+    IDD_ABOUTBOX, DIALOG
+    BEGIN
+        RIGHTMARGIN, 165
+    END
+END
+#endif    // APSTUDIO_INVOKED
+
+
+/////////////////////////////////////////////////////////////////////////////
+//
+// Dialog Info
+//
+
+IDD_RADCALI_DIALOG DLGINIT
+BEGIN
+    IDC_COMBO_CORE, 0x403, 2, 0
+0x0032, 
+    IDC_COMBO_CORE, 0x403, 2, 0
+0x0034, 
+    IDC_COMBO_CORE, 0x403, 2, 0
+0x0038, 
+    IDC_COMBO_CORE, 0x403, 3, 0
+0x3631, "\000" 
+    IDC_COMBO_CORE, 0x403, 3, 0
+0x3233, "\000" 
+    IDC_COMBO_CORE, 0x403, 3, 0
+0x3834, "\000" 
+    0
+END
+
+
+/////////////////////////////////////////////////////////////////////////////
+//
+// String Table
+//
+
+STRINGTABLE DISCARDABLE 
+BEGIN
+    IDS_ABOUTBOX            "&About ..."
+END
+
+#endif    // English (U.S.) resources
+/////////////////////////////////////////////////////////////////////////////
+
+
+
+#ifndef APSTUDIO_INVOKED
+/////////////////////////////////////////////////////////////////////////////
+//
+// Generated from the TEXTINCLUDE 3 resource.
+//
+#define _AFX_NO_SPLITTER_RESOURCES
+#define _AFX_NO_OLE_RESOURCES
+#define _AFX_NO_TRACKER_RESOURCES
+#define _AFX_NO_PROPERTY_RESOURCES
+
+#if !defined(AFX_RESOURCE_DLL) || defined(AFX_TARG_ENU)
+#ifdef _WIN32
+LANGUAGE 9, 1
+#pragma code_page(1252)
+#endif //_WIN32
+#include "res\RadCali.rc2"  // non-Microsoft Visual C++ edited resources
+#include "afxres.rc"         // Standard components
+#endif
+
+/////////////////////////////////////////////////////////////////////////////
+#endif    // not APSTUDIO_INVOKED
+
