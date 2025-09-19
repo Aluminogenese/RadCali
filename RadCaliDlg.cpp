@@ -710,7 +710,7 @@ void CRadCaliDlg::Process()
 #ifdef _DEBUG
             sprintf(strCmd, "TIE@%s",strT ); 
             MchTie( strCmd ); 
-            break;
+            //break;
 #else
             sprintf(strCmd, "%s TIE@%s",strExe,strT ); 
             print2Log( "%s\n",strCmd );
@@ -966,12 +966,63 @@ static bool GetPxl(double gx,double gy,CWuErsImage *pImg,short *pv,int gs,double
     return true;
 }
 
+// 辐射相关性计算函数
+double CalculateRadiationCorrelation(short cv[4], short rv[4]) {
+    // 计算多波段相关系数
+    double sum1 = 0, sum2 = 0, sum11 = 0, sum22 = 0, sum12 = 0;
+    int valid_bands = 0;
+
+    for (int b = 0; b < 4; b++) {
+        if (cv[b] > 0 && rv[b] > 0) { // 只处理有效波段
+            sum1 += cv[b];
+            sum2 += rv[b];
+            sum11 += cv[b] * cv[b];
+            sum22 += rv[b] * rv[b];
+            sum12 += cv[b] * rv[b];
+            valid_bands++;
+        }
+    }
+
+    if (valid_bands < 2) return 0; // 至少需要两个有效波段
+
+    double numerator = valid_bands * sum12 - sum1 * sum2;
+    double denominator = sqrt((valid_bands * sum11 - sum1 * sum1) *
+        (valid_bands * sum22 - sum2 * sum2));
+
+    return fabs(denominator) > 1e-6 ? numerator / denominator : 0;
+}
+
+// 光谱差异计算函数
+double CalculateSpectralDifference(short cv[4], short rv[4]) {
+    // 计算归一化光谱角距离
+    double dot_product = 0, norm1 = 0, norm2 = 0;
+    int valid_bands = 0;
+
+    for (int b = 0; b < 4; b++) {
+        if (cv[b] > 0 && rv[b] > 0) {
+            dot_product += cv[b] * rv[b];
+            norm1 += cv[b] * cv[b];
+            norm2 += rv[b] * rv[b];
+            valid_bands++;
+        }
+    }
+
+    if (valid_bands < 2) return 1.0; // 最大差异
+
+    double spectral_angle = acos(dot_product / (sqrt(norm1) * sqrt(norm2)));
+    return spectral_angle / (PI / 2); // 归一化到[0,1]
+}
+
 BOOL MchTie(LPCSTR lpstrPar)
 {
     char strSrc[256],strRef[256],strTsk[256],str[512],strOlp[512];
     double fc,fr,fc1,fr1,sz,vz,as,sz1,vz1,as1;
     double cx,cy,cz,phi,img,kap,grdZ,cx1,cy1,cz1,phi1,img1,kap1,grdZ1; 
     int idx,yy,mm,dd,ho,mi,se,yy1,mm1,dd1,ho1,mi1,se1,utmZn=0,gs=21,ws=5,bTxt=0;
+
+    double min_correlation = 0.7;    // 辐射相关性最小阈值
+    double max_spectral_diff = 0.3;  // 光谱差异最大阈值
+
     const char *pS = strrchr(lpstrPar,'@'); if ( pS ){ pS++; while( *pS==' ' ) pS++; }else pS = lpstrPar; strcpy( strTsk,pS );
     FILE *fTsk = fopen( strTsk,"rt" );
     fgets( str,512,fTsk ); sscanf( str,"%s",strSrc ); DOS_PATH(strSrc);
@@ -1038,6 +1089,14 @@ BOOL MchTie(LPCSTR lpstrPar)
                 if ( !GetPxl(gx,gy,&basImg,rv,(yy1==0)?0:ws,&fc1,&fr1) ) continue;
                 if ( rv[0]==0 && rv[1]==0 && rv[2]==0 ) continue;
                 if ( rv[0]<0 || rv[1]<0 || rv[2]<0 || rv[3]<0 || cv[0]<0 || cv[1]<0 || cv[2]<0 || cv[3]<0 ) continue;
+
+                // 1. 辐射一致性检查
+                double correlation = CalculateRadiationCorrelation(cv, rv);
+                if (correlation < min_correlation) continue;
+
+                // 2. 光谱特征一致性检查
+                double spectral_diff = CalculateSpectralDifference(cv, rv);
+                if (spectral_diff > max_spectral_diff) continue;
 
                 geoCvt.Cvt_Prj2LBH( gx,gy,gz,&lon,&lat,&hei );
                 getSunPos( gx,gy,gz,cx,cy,cz,lon*SPGC_R2D,lat*SPGC_R2D,yy,mm,dd,ho,mi,se,&sz,&vz,&as );                
