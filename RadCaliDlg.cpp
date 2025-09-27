@@ -782,10 +782,10 @@ void CRadCaliDlg::Process()
             memset( b,0,sizeof(double)*(sum*4) );
             for( i=0;i<sum;i++,ProgStep(cancel) ){
                 if ( ::WaitForSingleObject(m_hEThEHdl,1)==WAIT_OBJECT_0 ) break;
-        
+
                 m_listCtrl.GetItemText(i,0,str,256);  print2Log("process[%d @ %d]: %s ",i+1,sum,strrchr(str,'\\') ); UINT ss = GetTickCount();
                 sprintf( strT,"%s%s.tsk",strRom,strrchr(str,'\\') );
-        
+
                 FILE *fTsk = fopen( strT,"rt" ); if (!fTsk) continue;
                 fgets( str,512,fTsk ); sscanf( str,"%s",strSrc ); DOS_PATH(strSrc);
                 fgets( str,512,fTsk ); sscanf( str,"%d",&idx );
@@ -811,7 +811,7 @@ void CRadCaliDlg::Process()
                                 a[ idx *4 + 2] = -k2;
                                 a[ idx *4 + 3] = pOs->cv[c]; // g1
                                 Nrml( a,(sum*4),l,aa,b,1 );
-                            }
+                                    }
                         }else{
                             for( v=0;v<oz;v++,pOs++ ){
                                 k1  = getKval( 1,pOs->csz,pOs->cvz,pOs->cas );
@@ -833,12 +833,12 @@ void CRadCaliDlg::Process()
                                 a[ idxr*4 + 2] = -k2r;
                                 a[ idxr*4 + 3] = 0;
                                 Nrml( a,(sum*4),l,aa,b,0.1 );
+                                }
                             }
                         }
                     }
-                }
                 print2Log(", used tm= %.2lf sec \n",(GetTickCount()-ss)*0.001 );
-            }
+                }
             print2Log("Norml ...over. tm= %.2lf sec \nSolve ... st= %d \n",(GetTickCount()-st)*0.001,GetTickCount() ); 
 
             memset( x,0,sizeof(double)*(sum*4) );  st = GetTickCount();
@@ -846,14 +846,14 @@ void CRadCaliDlg::Process()
 
             print2Log( "Solve .. over. tm = %.2lf \n",(GetTickCount()-st)*0.001 );
 
-            sprintf(str, "%s//pre_bnd%d.txt", strRom, c + 1);
+                    sprintf(str, "%s//pre_bnd%d.txt", strRom, c + 1);
             FILE *fKnl = fopen( str,"wt" );
             for( i=0;i<sum;i++ ){
                 m_listCtrl.GetItemText(i,0,str,256);
                 fprintf( fKnl,"%9.6lf \t %15.6lf \t %15.6lf \t %15.6lf \t %s\n",x[i*4+3],x[i*4+0],x[i*4+1],x[i*4+2],strrchr(str,'\\') );
-            }
-            fclose(fKnl);
-        }
+                    }
+                    fclose(fKnl);
+                }
         delete []pAK1;
         delete []aa; 
         delete []a;
@@ -967,7 +967,7 @@ static bool GetPxl(double gx,double gy,CWuErsImage *pImg,short *pv,int gs,double
 }
 
 // 辐射相关性计算函数
-double CalculateRadiationCorrelation(short cv[4], short rv[4]) {
+static inline double CalculateRadiationCorrelation(short cv[4], short rv[4]) {
     // 计算多波段相关系数
     double sum1 = 0, sum2 = 0, sum11 = 0, sum22 = 0, sum12 = 0;
     int valid_bands = 0;
@@ -993,7 +993,7 @@ double CalculateRadiationCorrelation(short cv[4], short rv[4]) {
 }
 
 // 光谱差异计算函数
-double CalculateSpectralDifference(short cv[4], short rv[4]) {
+static inline double CalculateSpectralDifference(short cv[4], short rv[4]) {
     // 计算归一化光谱角距离
     double dot_product = 0, norm1 = 0, norm2 = 0;
     int valid_bands = 0;
@@ -1013,6 +1013,17 @@ double CalculateSpectralDifference(short cv[4], short rv[4]) {
     return spectral_angle / (PI / 2); // 归一化到[0,1]
 }
 
+static inline double BandMean(const short v[4], int& valid) {
+    double s = 0; valid = 0;
+    for (int i = 0; i < 4; i++) { if (v[i] > 0) { s += v[i]; valid++; } }
+    return valid ? s / valid : 0.0;
+}
+static inline double BandVar(const short v[4]) {
+    int valid = 0; double m = BandMean(v, valid); if (valid < 2) return 0;
+    double s = 0; for (int i = 0; i < 4; i++) if (v[i] > 0) s += (v[i] - m) * (v[i] - m);
+    return s / (valid - 1);
+}
+
 BOOL MchTie(LPCSTR lpstrPar)
 {
     char strSrc[256],strRef[256],strTsk[256],str[512],strOlp[512];
@@ -1020,8 +1031,8 @@ BOOL MchTie(LPCSTR lpstrPar)
     double cx,cy,cz,phi,img,kap,grdZ,cx1,cy1,cz1,phi1,img1,kap1,grdZ1; 
     int idx,yy,mm,dd,ho,mi,se,yy1,mm1,dd1,ho1,mi1,se1,utmZn=0,gs=21,ws=5,bTxt=0;
 
-    double min_correlation = 0.7;    // 辐射相关性最小阈值
-    double max_spectral_diff = 0.3;  // 光谱差异最大阈值
+    double minCorr = 0.7;    // 辐射相关性最小阈值
+    double maxSpecDiff = 0.3;  // 光谱差异最大阈值
 
     const char *pS = strrchr(lpstrPar,'@'); if ( pS ){ pS++; while( *pS==' ' ) pS++; }else pS = lpstrPar; strcpy( strTsk,pS );
     FILE *fTsk = fopen( strTsk,"rt" );
@@ -1076,6 +1087,7 @@ BOOL MchTie(LPCSTR lpstrPar)
         strcat( strRef,".ers" ); if ( !basImg.Load4File(strRef) ) continue;
 
         olpF.SetSize(0); rowsr = basImg.GetRows();
+		int tieSum=0, vSum = 0, cSum = 0, sSum = 0, varSum = 0;
         for( r=1;r<rows-gs;r+=gs ){
             for(  c=1;c<cols-gs;c+=gs ){
                 short *pC = (short*)(domImg.m_pImgDat+ (r*cols+c)* pxSz);
@@ -1085,18 +1097,31 @@ BOOL MchTie(LPCSTR lpstrPar)
                 gy = domImg.m_tlY - (rows-1-r)*domImg.m_dy;
                 gz = grdZ;                
                 if ( !GetPxl(gx,gy,&domImg,cv,ws,&fc ,&fr ) ) continue;
-                if ( cv[0]==0 && cv[1]==0 && cv[2]==0 ) continue;
+                //if ( cv[0]==0 && cv[1]==0 && cv[2]==0 ) continue;
                 if ( !GetPxl(gx,gy,&basImg,rv,(yy1==0)?0:ws,&fc1,&fr1) ) continue;
-                if ( rv[0]==0 && rv[1]==0 && rv[2]==0 ) continue;
-                if ( rv[0]<0 || rv[1]<0 || rv[2]<0 || rv[3]<0 || cv[0]<0 || cv[1]<0 || cv[2]<0 || cv[3]<0 ) continue;
-
+                //if ( rv[0]==0 && rv[1]==0 && rv[2]==0 ) continue;
+                if (rv[0] <= 0 || rv[1] <= 0 || rv[2] <= 0 || rv[3] <= 0 || cv[0] <= 0 || cv[1] <= 0 || cv[2] <= 0 || cv[3] <= 0) {
+                    vSum++;
+                    continue;
+                }
                 // 1. 辐射一致性检查
-                double correlation = CalculateRadiationCorrelation(cv, rv);
-                if (correlation < min_correlation) continue;
-
+                double corr = CalculateRadiationCorrelation(cv, rv);
+                if (corr < minCorr) {
+					cSum++;
+                    continue;
+                }
                 // 2. 光谱特征一致性检查
-                double spectral_diff = CalculateSpectralDifference(cv, rv);
-                if (spectral_diff > max_spectral_diff) continue;
+                double specDiff = CalculateSpectralDifference(cv, rv);
+                if (specDiff > maxSpecDiff) {
+                    sSum++;
+                    continue;
+                }
+                double varC = BandVar(cv);
+                double varR = BandVar(rv);
+                if (varC < 30 || varR < 30) {
+                    varSum++;
+                    continue; // 低纹理点剔除 (阈值可调)
+                }
 
                 geoCvt.Cvt_Prj2LBH( gx,gy,gz,&lon,&lat,&hei );
                 getSunPos( gx,gy,gz,cx,cy,cz,lon*SPGC_R2D,lat*SPGC_R2D,yy,mm,dd,ho,mi,se,&sz,&vz,&as );                
@@ -1104,8 +1129,10 @@ BOOL MchTie(LPCSTR lpstrPar)
                 else getSunPos( gx,gy,gz,cx1,cy1,cz1,lon*SPGC_R2D,lat*SPGC_R2D,yy1,mm1,dd1,ho1,mi1,se1,&sz1,&vz1,&as1 );
 
                 olpF.Append( sz,vz,as,int(fc),int(rows-1-fr),cv,sz1,vz1,as1,int(fc1),int(rowsr-1-fr1),rv );
+				tieSum++;
             }
         }
+		cprintf("tieSum= %d, skip (value<=0)=%d correlation=%d spectral=%d var=%d\n", tieSum, vSum, cSum, sSum, varSum);
         olpF.Save2File(strOlp);
         if ( bTxt ){ strcat(strOlp, ".txt"); olpF.Save2File(strOlp,0); }
     }
