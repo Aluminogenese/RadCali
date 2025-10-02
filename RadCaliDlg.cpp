@@ -25,6 +25,8 @@
 #include "TMFile.hpp"
 #include "OlpFile.hpp"
 
+#define USE_EIGEN_BA 1
+
 #ifdef _DEBUG
 #define new DEBUG_NEW
 #undef THIS_FILE
@@ -37,6 +39,12 @@ static char THIS_FILE[] = __FILE__;
 #define TSK_STA_OVER    "任务完成"
 #define TSK_STA_EXIT    "程序退出"
 #define TSK_STA_TERM    "执行被取消"
+
+#define USE_ITERATIVE_SOLVER 1     // 使用迭代求解器
+#define STREAM_PROCESSING 1        // 流式处理模式
+#define CHUNK_SIZE 10000          // 数据块大小
+#define MAX_SOLVER_ITERATIONS 1000 // 最大迭代次数
+#define SOLVER_TOLERANCE 1e-8      // 求解精度
 
 #define MAX_CPU             64
 static HWND  gs_hWnd;
@@ -148,7 +156,8 @@ CRadCaliDlg::CRadCaliDlg(CWnd* pParent /*=NULL*/)
 	m_strBas = _T("");
 	m_gs = 8;
 	m_ws = 3;
-	m_bTie = TRUE;
+	//m_bTie = TRUE;
+    m_bTie = FALSE;
 	m_bAdj = TRUE;
 	m_bTxt = FALSE;
 	//}}AFX_DATA_INIT
@@ -341,6 +350,10 @@ BOOL CRadCaliDlg::OnInitDialog()
     m_cmbMxCore.AddString( m_strMxCore );
     m_strMxCore = AfxGetApp()->GetProfileString( "CRadCaliDlg","CPUs",m_strMxCore );
 
+    m_ompThreads = (std::max)(1, atoi(m_strMxCore));
+#ifdef _OPENMP
+    omp_set_num_threads(m_ompThreads);
+#endif
     UpdateData(FALSE);
 	return TRUE;  // return TRUE  unless you set the focus to a control
 }
@@ -538,7 +551,12 @@ void CRadCaliDlg::OnKeydownListCtrl(NMHDR* pNMHDR, LRESULT* pResult)
 DWORD WINAPI WuProcThread( LPVOID lpParam ) 
 {
 	CRadCaliDlg *pDlg = (CRadCaliDlg *)lpParam;
-	pDlg->Process();  ::ExitThread( 0 );  return TRUE;
+#ifdef USE_EIGEN_BA
+    pDlg->ProcessWithEigen();
+#else
+	pDlg->Process();
+#endif
+    ::ExitThread( 0 );  return TRUE;
 }
 
 
@@ -871,6 +889,323 @@ void CRadCaliDlg::Process()
     PostMessage( WM_OUTPUT_MSG,THREADEND,0 );
 }
 
+void CRadCaliDlg::ProcessWithEigen()
+{
+    gs_hWnd = m_hWnd;
+    m_hEThEHdl = ::CreateEvent(NULL, TRUE, FALSE, itostr(LONG(this)));
+
+    CTime stTm; SYSTEM_INFO sysInfo; GetSystemInfo(&sysInfo);
+    if (sysInfo.dwNumberOfProcessors > MAX_CPU) sysInfo.dwNumberOfProcessors = MAX_CPU;
+    BOOL bRun = FALSE; int maxTm = 120, cpuSum = atoi(m_strMxCore);
+    if (cpuSum < 1) cpuSum = 1;  if (cpuSum > sysInfo.dwNumberOfProcessors - 1) cpuSum = sysInfo.dwNumberOfProcessors - 1;
+    char strCmd[1024], strExe[256]; ::GetModuleFileName(NULL, strExe, sizeof(strExe));
+
+    m_strMxCore.Format("%d", cpuSum);
+    AfxGetApp()->WriteProfileString("CRadCaliDlg", "CPUs", m_strMxCore);
+
+    char* pS, strDir[256], strT[256], str[512];
+    strcpy(strDir, m_strRet); pS = strrchr(strDir, '\\'); if (pS) *pS = 0;
+
+    char strRom[256]; sprintf(strRom, "%s\\ROM_S2B", strDir);
+    CreateDir(strRom);
+
+    char strLog[256]; strcpy(strLog, m_strRet);
+    sprintf(str, "%s-s2b-eigen.log", strLog);
+    ::DeleteFile(str);  openLog(str);
+
+    int i, j, c, b, sum = m_listCtrl.GetItemCount();
+
+    struct RI {
+        int idx;
+        float area;
+    }; RI iRi, * pRi = new RI[sum + 8];
+    struct RGN {
+        double x[8];
+        double y[8];
+        int sz;
+    }; RGN iRg, * pRg = new RGN[sum + 8];
+    memset(pRg, 0, sizeof(RGN) * sum);
+    IMGPAR imgPar; CTMGeom cc;
+    double xs, ys, zs, phi, omg, kap, grdZ;
+    sprintf(strT, "%s\\imgPar.dpi", strDir); DOS_PATH(strT);
+    CTMVziFile vziFile; vziFile.Load4File(strT);
+    for (i = 0; i < sum; i++) {
+        m_listCtrl.GetItemText(i, 1, str, 256);
+        imgPar = vziFile.m_imgPar;
+        sscanf(str, "%lf%lf%lf%lf%lf%lf%lf", &xs, &ys, &zs, &phi, &omg, &kap, &grdZ);
+        imgPar.aopX = xs; imgPar.aopY = ys; imgPar.aopZ = zs;
+        imgPar.aopP = phi; imgPar.aopO = omg; imgPar.aopK = kap;
+        cc.Init(&imgPar); pRg[i].sz = 4;
+        cc.GetGrdPrjRgn(imgPar.iopX * 2, imgPar.iopY * 2, grdZ, pRg[i].x, pRg[i].y);
+    }
+
+    if (m_bTie) print2Log("MchTie start...\n");
+
+    ProgBegin(sum); int cancel;
+    for (i = 0; i < sum; i++, ProgStep(cancel)) {
+        if (::WaitForSingleObject(m_hEThEHdl, 1) == WAIT_OBJECT_0) break;
+
+        m_listCtrl.GetItemText(i, 0, str, 256);  print2Log("process: %s\n", strrchr(str, '\\'));
+        sprintf(strT, "%s%s.tsk", strRom, strrchr(str, '\\'));
+        FILE* fTsk = fopen(strT, "wt");
+        fprintf(fTsk, "%s\n%d %s %d %d %d\n", str, i, m_listCtrl.GetItemText(i, 1), m_gs, m_ws, m_bTxt);
+        fprintf(fTsk, "%s\n%s\n", m_strBas, "-1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 ");
+
+        iRi.area = (float)(GetRgnArea(pRg[i].x, pRg[i].y, pRg[i].sz));
+        memset(pRi, 0, sizeof(RI) * sum);
+        for (j = 0; j < sum; j++) {
+            if (j == i) continue;
+            iRg.sz = 0;
+            RgnClip(pRg[i].x, pRg[i].y, pRg[i].sz,
+                pRg[j].x, pRg[j].y, pRg[j].sz,
+                iRg.x, iRg.y, &iRg.sz);
+            if (iRg.sz > 2) {
+                pRi[j].idx = j;
+                pRi[j].area = (float)(GetRgnArea(iRg.x, iRg.y, iRg.sz));
+            }
+        }
+        qsort(pRi, sum, sizeof(RI), &comRI);
+        for (j = 0; j < sum; j++) {
+            if (pRi[j].area / iRi.area < 0.01) break;
+            fprintf(fTsk, "%s\n", m_listCtrl.GetItemText(pRi[j].idx, 0));
+            fprintf(fTsk, "%d %s\n", pRi[j].idx, m_listCtrl.GetItemText(pRi[j].idx, 1));
+        }
+        fclose(fTsk);
+
+        if (m_bTie) {
+#ifdef _DEBUG
+            sprintf(strCmd, "TIE@%s", strT);
+            MchTie(strCmd);
+#else
+            sprintf(strCmd, "%s TIE@%s", strExe, strT);
+            print2Log("%s\n", strCmd);
+#endif
+
+            bRun = FALSE;
+            while (!bRun) {
+                for (int c = 0; c < cpuSum; c++) {
+                    if (gs_hThreadId[c] == NULL) {
+                        strcpy(gs_strCmd[c], strCmd);
+                        HANDLE hThread = ::CreateThread(NULL, 0, CupThread_CRadCaliDlg, (void*)gs_strCmd[c], 0, gs_hThreadId + c);
+                        ::CloseHandle(hThread); bRun = TRUE; break;
+                    }
+                    if (::WaitForSingleObject(m_hEThEHdl, 16) == WAIT_OBJECT_0) break;
+                }
+            }
+        }
+    }
+    delete[]pRi;
+    delete[]pRg;
+
+    stTm = CTime::GetCurrentTime();
+    while (1) {
+        for (c = 0; c < MAX_CPU; c++) { if (gs_hThreadId[c] != NULL) break; }
+        if (c == MAX_CPU || ::WaitForSingleObject(m_hEThEHdl, 128) == WAIT_OBJECT_0) break;
+        CTimeSpan ts = CTime::GetCurrentTime() - stTm;
+        if (ts.GetTotalMinutes() > maxTm) {
+            for (int i = 0; i < MAX_CPU; i++) {
+                if (gs_hProcId[i]) {
+                    HANDLE hProc = ::OpenProcess(PROCESS_TERMINATE, FALSE, gs_hProcId[i]);
+                    if (hProc) ::TerminateProcess(hProc, 0x22);
+                    gs_hProcId[i] = 0; Sleep(8);
+                }
+            }
+            break;
+        }
+    }
+    if (m_bTie) print2Log("MchTie over.\n");
+    ProgEnd();
+
+    COlpFile olpF; char strSrc[256], strRef[256], strOlp[512]; int idx, idxr;
+    if (m_bAdj) {
+        print2Log("RadBA with Eigen start...\n");
+
+        double* pAK1 = new double[sum * 2];
+        double* pAK2 = pAK1 + sum;
+        memset(pAK1, 0, sizeof(double)* sum * 2);
+        for (i = 0; i < sum; i++) {
+            m_listCtrl.GetItemText(i, 0, str, 256);
+            sprintf(strT, "%s%s.tsk_skm.txt", strRom, strrchr(str, '\\'));
+            FILE* fKM = fopen(strT, "rt");
+            fscanf(fKM, "%lf%lf", pAK1 + i, pAK2 + i);   print2Log("%lf %lf\n", pAK1[i], pAK2[i]);
+            fclose(fKM);
+        }
+
+        ProgBegin(sum * 4);
+        for (c = 0; c < 4; c++) {
+            UINT st = GetTickCount();
+            print2Log("proc band %d with Eigen, st= %d\n", c + 1, st);
+
+            Eigen::SparseMatrix<double> AtA(sum * 4, sum * 4);
+            Eigen::VectorXd Atb = Eigen::VectorXd::Zero(sum * 4);
+
+            for (i = 0; i < sum; i++, ProgStep(cancel)) {
+                if (::WaitForSingleObject(m_hEThEHdl, 1) == WAIT_OBJECT_0) break;
+
+                m_listCtrl.GetItemText(i, 0, str, 256); print2Log("process[%d @ %d]: %s ", i + 1, sum, strrchr(str, '\\')); UINT ss = GetTickCount();
+                sprintf(strT, "%s%s.tsk", strRom, strrchr(str, '\\'));
+
+                FILE* fTsk = fopen(strT, "rt");
+                if (!fTsk) continue;
+
+                fgets(str, 512, fTsk); sscanf(str, "%s", strSrc); DOS_PATH(strSrc);
+                fgets(str, 512, fTsk); sscanf(str, "%d", &idx);
+
+                std::vector<Eigen::Triplet<double>> triplets;
+
+                while (!feof(fTsk)) {
+                    if (!fgets(str, 512, fTsk)) break;
+                    sscanf(str, "%s", strRef); DOS_PATH(strRef);
+                    if (!fgets(str, 512, fTsk)) break;
+                    sscanf(str, "%d", &idxr);
+                    strcpy(strOlp, strT);  strcpy(strrchr(strOlp, '.'), "_");
+                    strcat(strOlp, strrchr(strRef, '\\') + 1); strcat(strOlp, ".olp");
+
+                    if (olpF.Load4File(strOlp)) {
+                        double k1, k2, k1r, k2r, l;
+                        int v, oz; OBV* pOs = olpF.GetData(&oz); cprintf("%s tieSum= %d\n", strOlp, oz);
+
+                        if (idxr == -1) {
+                            for(v=0;v<oz;v++,pOs++){
+                                k1 = getKval(1, pOs->csz, pOs->cvz, pOs->cas);
+                                k2 = getKval(4, pOs->csz, pOs->cvz, pOs->cas);
+                                k1 -= pAK1[idx]; k2 -= pAK2[idx];
+								l = pOs->rv[c];// gb
+                                std::vector<std::pair<int, double>> a_nonzeros;
+                                a_nonzeros.push_back({ idx * 4 + 0, -1 });
+                                a_nonzeros.push_back({ idx * 4 + 1, -k1 });
+                                a_nonzeros.push_back({ idx * 4 + 2, -k2 });
+                                a_nonzeros.push_back({ idx * 4 + 3, pOs->cv[c] });
+
+                                for (const auto& ai : a_nonzeros) {
+                                    for (const auto& aj : a_nonzeros) {
+                                        triplets.push_back(Eigen::Triplet<double>(ai.first, aj.first, ai.second * aj.second));
+                                    }
+                                    Atb[ai.first] += ai.second * l;
+                                }
+                            }
+                        }
+                        else {
+                            for (v = 0; v < oz; v++, pOs++) {
+                                k1 = getKval(1, pOs->csz, pOs->cvz, pOs->cas);
+                                k2 = getKval(4, pOs->csz, pOs->cvz, pOs->cas);
+                                k1 -= pAK1[idx]; k2 -= pAK2[idx];
+                                k1r = getKval(1, pOs->rsz, pOs->rvz, pOs->ras);
+                                k2r = getKval(4, pOs->rsz, pOs->rvz, pOs->ras);
+                                k1r -= pAK1[idxr]; k2r -= pAK2[idxr];
+                                l = pOs->cv[c] - pOs->rv[c];
+                                std::vector<std::pair<int, double>> a_nonzeros;
+                                a_nonzeros.push_back({ idx * 4 + 0, 1 });
+                                a_nonzeros.push_back({ idx * 4 + 1, k1 });
+                                a_nonzeros.push_back({ idx * 4 + 2, k2 });
+                                a_nonzeros.push_back({ idxr * 4 + 0, -1 });
+                                a_nonzeros.push_back({ idxr * 4 + 1, -k1r });
+                                a_nonzeros.push_back({ idxr * 4 + 2, -k2r });
+
+                                for (const auto& ai : a_nonzeros) {
+                                    for (const auto& aj : a_nonzeros) {
+                                        triplets.push_back(Eigen::Triplet<double>(ai.first, aj.first, ai.second * aj.second));
+                                    }
+                                    Atb[ai.first] += ai.second * l;
+                                }
+                            }
+                        }
+
+                    }
+                }
+                fclose(fTsk);
+                Eigen::SparseMatrix<double> temp_AtA(sum * 4, sum * 4);
+                temp_AtA.setFromTriplets(triplets.begin(), triplets.end());
+
+                AtA += temp_AtA;
+                print2Log(", used tm= %.2lf sec\n", (GetTickCount() - ss) * 0.001);
+            }
+            print2Log("Norml ...over. tm= %.2lf sec \nSolve ... st= %d \n", (GetTickCount() - st) * 0.001, GetTickCount());
+
+            st = GetTickCount();
+            print2Log("Solving with iterative solver...\n");
+
+            Eigen::VectorXd x = Eigen::VectorXd::Zero(sum * 4);
+
+            bool solved = false;
+
+            // 共轭梯度法
+            if (!solved) {
+                Eigen::ConjugateGradient<Eigen::SparseMatrix<double>, Eigen::Lower | Eigen::Upper> cg;
+                cg.setMaxIterations(MAX_SOLVER_ITERATIONS);
+                cg.setTolerance(SOLVER_TOLERANCE);
+                cg.compute(AtA);
+
+                if (cg.info() == Eigen::Success) {
+                    x = cg.solve(Atb);
+                    if (cg.info() == Eigen::Success) {
+                        print2Log("ConjugateGradient solve success. Iterations: %ld, Error: %.2e, tm: %.2lf sec\n",
+                            cg.iterations(), cg.error(), (GetTickCount() - st) * 0.001);
+                        solved = true;
+                    }
+                }
+            }
+
+            //双共轭梯度稳定法（适合非对称系统）
+            if (!solved) {
+                Eigen::BiCGSTAB<Eigen::SparseMatrix<double>> bicgstab;
+                bicgstab.setMaxIterations(MAX_SOLVER_ITERATIONS);
+                bicgstab.setTolerance(SOLVER_TOLERANCE);
+                bicgstab.compute(AtA);
+
+                if (bicgstab.info() == Eigen::Success) {
+                    x = bicgstab.solve(Atb);
+                    if (bicgstab.info() == Eigen::Success) {
+                        print2Log("BiCGSTAB solve success. Iterations: %ld, Error: %.2e, tm: %.2lf sec\n",
+                            bicgstab.iterations(), bicgstab.error(), (GetTickCount() - st) * 0.001);
+                        solved = true;
+                    }
+                }
+            }
+
+            //稀疏LU分解（内存消耗较大但最稳定）
+            if (!solved) {
+                print2Log("Iterative solvers failed, using Sparse LU...\n");
+                Eigen::SparseLU<Eigen::SparseMatrix<double>> sparseLU;
+                sparseLU.compute(AtA);
+
+                if (sparseLU.info() == Eigen::Success) {
+                    x = sparseLU.solve(Atb);
+                    if (sparseLU.info() == Eigen::Success) {
+                        print2Log("SparseLU solve success. tm: %.2lf sec\n", (GetTickCount() - st) * 0.001);
+                        solved = true;
+                    }
+                }
+            }
+
+            if (!solved) {
+                print2Log("All solvers failed for band %d!\n", c + 1);
+                continue;
+            }
+
+            sprintf(str, "%s//pre_bnd%d_eigen.txt", strRom, c + 1);
+            FILE* fKnl = fopen(str, "wt");
+            if (fKnl) {
+                for (i = 0; i < sum; i++) {
+                    m_listCtrl.GetItemText(i, 0, str, 256);
+                    fprintf(fKnl, "%9.6lf \t %15.6lf \t %15.6lf \t %15.6lf \t %s\n",
+                        x[i * 4 + 3], x[i * 4 + 0], x[i * 4 + 1], x[i * 4 + 2],
+                        strrchr(str, '\\'));
+                }
+                fclose(fKnl);
+            }
+        }
+        ProgEnd();
+        print2Log("RadBA with Eigen completed.\n");
+    }
+
+    if (m_hW4EndHdl) ::SetEvent(m_hW4EndHdl);
+    if (m_hEThEHdl) ::CloseHandle(m_hEThEHdl); m_hEThEHdl = NULL;
+    ::CloseHandle(m_hThread); m_hThread = NULL;
+
+    PostMessage(WM_OUTPUT_MSG, THREADEND, 0);
+}
+
 void CRadCaliDlg::OnTaskOver( UINT tskId )
 {
     int tskSum = m_listCtrl.GetItemCount();
@@ -1053,6 +1388,7 @@ BOOL MchTie(LPCSTR lpstrPar)
     strcpy( str,strTsk ); strcat( str,"_skm.txt" );
     FILE *fKM = fopen( str,"wt" );
     if ( fKM ){
+#pragma omp parallel for reduction(+:avK1, avK2, ks) schedule(dynamic)
         for( r=1;r<rows-gs;r+=gs ){
             for(  c=1;c<cols-gs;c+=gs ){
                 short *pC = (short*)(domImg.m_pImgDat+ (r*cols+c)* pxSz);
@@ -1063,9 +1399,11 @@ BOOL MchTie(LPCSTR lpstrPar)
                     gz = grdZ; 
                     geoCvt.Cvt_Prj2LBH( gx,gy,gz,&lon,&lat,&hei ); 
                     getSunPos( gx,gy,gz,cx,cy,cz,lon*SPGC_R2D,lat*SPGC_R2D,yy,mm,dd,ho,mi,se,&sz,&vz,&as );
-            
+#pragma omp atomic
                     avK1 += getKval( 1,sz,vz,as );
+#pragma omp atomic
                     avK2 += getKval( 4,sz,vz,as );
+#pragma omp atomic
                     ks += 1;
             }
         }
@@ -1088,6 +1426,10 @@ BOOL MchTie(LPCSTR lpstrPar)
 
         olpF.SetSize(0); rowsr = basImg.GetRows();
 		int tieSum=0, vSum = 0, cSum = 0, sSum = 0, varSum = 0;
+
+        COlpFile local_olpF;
+        local_olpF.SetSize(0);
+#pragma omp parallel for schedule(dynamic) collapse(2)
         for( r=1;r<rows-gs;r+=gs ){
             for(  c=1;c<cols-gs;c+=gs ){
                 short *pC = (short*)(domImg.m_pImgDat+ (r*cols+c)* pxSz);
@@ -1097,10 +1439,10 @@ BOOL MchTie(LPCSTR lpstrPar)
                 gy = domImg.m_tlY - (rows-1-r)*domImg.m_dy;
                 gz = grdZ;                
                 if ( !GetPxl(gx,gy,&domImg,cv,ws,&fc ,&fr ) ) continue;
-                //if ( cv[0]==0 && cv[1]==0 && cv[2]==0 ) continue;
+                if ( cv[0]==0 && cv[1]==0 && cv[2]==0 ) continue;
                 if ( !GetPxl(gx,gy,&basImg,rv,(yy1==0)?0:ws,&fc1,&fr1) ) continue;
-                //if ( rv[0]==0 && rv[1]==0 && rv[2]==0 ) continue;
-                if (rv[0] <= 0 || rv[1] <= 0 || rv[2] <= 0 || rv[3] <= 0 || cv[0] <= 0 || cv[1] <= 0 || cv[2] <= 0 || cv[3] <= 0) {
+                if ( rv[0]==0 && rv[1]==0 && rv[2]==0 ) continue;
+                if (rv[0] < 0 || rv[1] < 0 || rv[2] < 0 || rv[3] < 0 || cv[0] < 0 || cv[1] < 0 || cv[2] < 0 || cv[3] < 0) {
                     vSum++;
                     continue;
                 }
@@ -1110,30 +1452,36 @@ BOOL MchTie(LPCSTR lpstrPar)
 					cSum++;
                     continue;
                 }
-                // 2. 光谱特征一致性检查
-                double specDiff = CalculateSpectralDifference(cv, rv);
-                if (specDiff > maxSpecDiff) {
-                    sSum++;
-                    continue;
-                }
-                double varC = BandVar(cv);
-                double varR = BandVar(rv);
-                if (varC < 30 || varR < 30) {
-                    varSum++;
-                    continue; // 低纹理点剔除 (阈值可调)
-                }
+     //           // 2. 光谱特征一致性检查
+     //           double specDiff = CalculateSpectralDifference(cv, rv);
+     //           if (specDiff > maxSpecDiff) {
+     //               sSum++;
+     //               continue;
+     //           }
+     //           double varC = BandVar(cv);
+     //           double varR = BandVar(rv);
+     //           if (varC < 30 || varR < 30) {
+     //               varSum++;
+     //               continue; // 低纹理点剔除 (阈值可调)
+     //           }
 
                 geoCvt.Cvt_Prj2LBH( gx,gy,gz,&lon,&lat,&hei );
                 getSunPos( gx,gy,gz,cx,cy,cz,lon*SPGC_R2D,lat*SPGC_R2D,yy,mm,dd,ho,mi,se,&sz,&vz,&as );                
                 if ( yy1==0 ){ sz1 = vz1 = as1 = 0; } 
                 else getSunPos( gx,gy,gz,cx1,cy1,cz1,lon*SPGC_R2D,lat*SPGC_R2D,yy1,mm1,dd1,ho1,mi1,se1,&sz1,&vz1,&as1 );
-
-                olpF.Append( sz,vz,as,int(fc),int(rows-1-fr),cv,sz1,vz1,as1,int(fc1),int(rowsr-1-fr1),rv );
-				tieSum++;
+#pragma omp critical
+                {
+                    local_olpF.Append(sz, vz, as, int(fc), int(rows - 1 - fr), cv,
+                        sz1, vz1, as1, int(fc1), int(rowsr - 1 - fr1), rv);
+                    tieSum++;
+                }
+                //olpF.Append( sz,vz,as,int(fc),int(rows-1-fr),cv,sz1,vz1,as1,int(fc1),int(rowsr-1-fr1),rv );
+				
             }
         }
 		cprintf("tieSum= %d, skip (value<=0)=%d correlation=%d spectral=%d var=%d\n", tieSum, vSum, cSum, sSum, varSum);
-        olpF.Save2File(strOlp);
+        //olpF.Save2File(strOlp);
+        local_olpF.Save2File(strOlp);
         if ( bTxt ){ strcat(strOlp, ".txt"); olpF.Save2File(strOlp,0); }
     }
     fclose(fTsk);

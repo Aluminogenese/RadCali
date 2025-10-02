@@ -13,8 +13,13 @@
 #define AFX_RADCALIDLG_H__40F95964_192C_4CF7_9B8B_758B5DC9A89D__INCLUDED_
 
 #include "Resource.h"
-
-
+#include <vector>
+#include <string>
+#include <Eigen/Dense>
+#include <Eigen/Sparse>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 #if _MSC_VER > 1000
 #pragma once
 #endif // _MSC_VER > 1000
@@ -121,7 +126,9 @@ protected:
 public:
     HANDLE	m_hThread;
     HANDLE  m_hEThEHdl,m_hW4EndHdl;
+    int m_ompThreads;
 	void    Process();
+    void    ProcessWithEigen();
 public:
     void    OnTaskOver( UINT tskId );
     void    OnTaskTerm( UINT tskGrpId,UINT tskId );
