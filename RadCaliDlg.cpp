@@ -1613,6 +1613,12 @@ static void SaveMatchesPlotVec(CWuErsImage& domImg,
     cv::imwrite(outPath, canvas);
 }
 
+static inline void ApplyCLAHE(cv::Mat& img) {
+    // 遥感图像动态范围大，CLAHE比全局均衡更稳
+    cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(3.0, cv::Size(32, 32));
+    clahe->apply(img, img);
+}
+
 struct ORBMatchResult {
     std::vector<cv::Point2f> ptsDom; // 主影像
     std::vector<cv::Point2f> ptsRef; // 参考影像
@@ -1620,12 +1626,14 @@ struct ORBMatchResult {
 
 static ORBMatchResult RunORBMatch(CWuErsImage& domImg,
     CWuErsImage& refImg,
-    int maxFeatures = 6000,
+    int maxFeatures = 40000,
     float scaleFactor = 1.2f,
     int nLevels = 8,
     float ratio = 0.75f,
     double ransacThresh = 2.0,
-    double ransacConf = 0.999)
+    double ransacConf = 0.999,
+    const cv::Mat* maskDom = nullptr,
+    const cv::Mat* maskRef = nullptr)
 {
     ORBMatchResult res;
 
@@ -1633,11 +1641,22 @@ static ORBMatchResult RunORBMatch(CWuErsImage& domImg,
     WuErsToGray8(domImg, gDom);
     WuErsToGray8(refImg, gRef);
 
+    ApplyCLAHE(gDom);
+    ApplyCLAHE(gRef);
+
     cv::Ptr<cv::ORB> orb = cv::ORB::create(maxFeatures, scaleFactor, nLevels);
     std::vector<cv::KeyPoint> kptsDom, kptsRef;
     cv::Mat descDom, descRef;
-    orb->detectAndCompute(gDom, cv::noArray(), kptsDom, descDom);
-    orb->detectAndCompute(gRef, cv::noArray(), kptsRef, descRef);
+    if (maskDom && !maskDom->empty())
+        orb->detectAndCompute(gDom, *maskDom, kptsDom, descDom);
+    else
+        orb->detectAndCompute(gDom, cv::noArray(), kptsDom, descDom);
+
+    if (maskRef && !maskRef->empty())
+        orb->detectAndCompute(gRef, *maskRef, kptsRef, descRef);
+    else
+        orb->detectAndCompute(gRef, cv::noArray(), kptsRef, descRef);
+
     if (descDom.empty() || descRef.empty()) return res;
 
     cv::BFMatcher matcher(cv::NORM_HAMMING, false);
@@ -1666,99 +1685,6 @@ static ORBMatchResult RunORBMatch(CWuErsImage& domImg,
             res.ptsDom.push_back(q1[i]);
             res.ptsRef.push_back(q2[i]);
         }
-    }
-    return res;
-}
-
-// 用掩膜的多尺度 ORB
-static ORBMatchResult RunORBMatchMultiScale(const CWuErsImage& domImg,
-    const CWuErsImage& refImg,
-    double sHint,                 // ≈ ref_dx/dom_dx
-    const cv::Mat* maskDom = nullptr,
-    const cv::Mat* maskRef = nullptr,
-    int   maxFeatures = 6000,
-    float scaleFactor = 1.2f,
-    int   nLevels = 8,
-    float ratio = 0.75f,
-    double ransacThresh = 2.0,
-    double ransacConf = 0.999)
-{
-    ORBMatchResult res;
-
-    // 1) 转灰度
-    cv::Mat gDom, gRef;
-    WuErsToGray8((CWuErsImage&)domImg, gDom);
-    WuErsToGray8((CWuErsImage&)refImg, gRef);
-
-    // 2) 仅按像元比在一侧做缩放（参考更粗则缩主图；参考更细则缩参考图；接近则不缩）
-    cv::Mat domUse = gDom.clone(), refUse = gRef.clone();
-    cv::Mat mdUse, mrUse;
-    double mapDom = 1.0, mapRef = 1.0;
-
-    if (sHint > 1.2) {
-        // 参考像元更大：下采主图
-        double sf = 1.0 / std::min(std::max(sHint, 0.25), 8.0);
-        cv::resize(gDom, domUse, cv::Size(), sf, sf, cv::INTER_AREA);
-        mapDom = 1.0 / sf;
-        if (maskDom && !maskDom->empty())
-            cv::resize(*maskDom, mdUse, domUse.size(), 0, 0, cv::INTER_NEAREST);
-        if (maskRef && !maskRef->empty())
-            mrUse = *maskRef; // 参考不缩，掩膜原尺寸
-    }
-    else if (sHint < 0.8) {
-        // 参考像元更小：下采参考图
-        double sf = std::min(std::max(sHint, 0.25), 1.0);
-        cv::resize(gRef, refUse, cv::Size(), sf, sf, cv::INTER_AREA);
-        mapRef = 1.0 / sf;
-        if (maskRef && !maskRef->empty())
-            cv::resize(*maskRef, mrUse, refUse.size(), 0, 0, cv::INTER_NEAREST);
-        if (maskDom && !maskDom->empty())
-            mdUse = *maskDom; // 主图不缩，掩膜原尺寸
-    }
-    else {
-        // 尺度接近：不缩放
-        if (maskDom) mdUse = *maskDom;
-        if (maskRef) mrUse = *maskRef;
-    }
-
-    // 3) 简单增强以提升角点质量（可选）
-    cv::equalizeHist(domUse, domUse);
-    cv::equalizeHist(refUse, refUse);
-
-    // 4) ORB 检测与描述
-    cv::Ptr<cv::ORB> orb = cv::ORB::create(maxFeatures, scaleFactor, nLevels);
-    std::vector<cv::KeyPoint> kptsDom, kptsRef;
-    cv::Mat descDom, descRef;
-    orb->detectAndCompute(domUse, (mdUse.empty() ? cv::noArray() : cv::InputArray(mdUse)), kptsDom, descDom);
-    orb->detectAndCompute(refUse, (mrUse.empty() ? cv::noArray() : cv::InputArray(mrUse)), kptsRef, descRef);
-    if (descDom.empty() || descRef.empty()) return res;
-
-    // 5) KNN + ratio test
-    cv::BFMatcher matcher(cv::NORM_HAMMING, false);
-    std::vector<std::vector<cv::DMatch>> knn;
-    matcher.knnMatch(descDom, descRef, knn, 2);
-
-    std::vector<cv::Point2f> q1, q2;
-    q1.reserve(knn.size()); q2.reserve(knn.size());
-    for (auto& k : knn) {
-        if (k.size() < 2) continue;
-        if (k[0].distance < ratio * k[1].distance) {
-            q1.push_back(kptsDom[k[0].queryIdx].pt);
-            q2.push_back(kptsRef[k[0].trainIdx].pt);
-        }
-    }
-    if (q1.size() < 8) return res;
-
-    // 6) RANSAC 估计基础矩阵
-    std::vector<unsigned char> inlierMask;
-    cv::Mat F = cv::findFundamentalMat(q1, q2, cv::FM_RANSAC, ransacThresh, ransacConf, inlierMask);
-    if (F.empty()) return res;
-
-    // 7) 映射回原始像素坐标
-    for (size_t i = 0; i < q1.size(); ++i) {
-        if (!inlierMask[i]) continue;
-        res.ptsDom.emplace_back(q1[i].x * mapDom, q1[i].y * mapDom);
-        res.ptsRef.emplace_back(q2[i].x * mapRef, q2[i].y * mapRef);
     }
     return res;
 }
@@ -1828,77 +1754,117 @@ BOOL MchTie(LPCSTR lpstrPar)
         char strPlot[512]; strcpy(strPlot, strOlp);
         char* pExtPng = strrchr(strPlot, '.'); if (pExtPng) strcpy(pExtPng, ".png"); else strcat(strPlot, ".png");
         int tieSum = 0, vSum = 0, cSum = 0;
-        bool usedExistingOlp = false;
-        std::vector<cv::Point2f> plotDom, plotRef; // 非现有 .olp 流程用于绘图
+        //bool usedExistingOlp = false;
+        //std::vector<cv::Point2f> plotDom, plotRef; // 非现有 .olp 流程用于绘图
 
         // 先尝试使用现有 .olp
-        if (IsExist(strOlp) && olpF.Load4File(strOlp)) {
-            int oz = 0; olpF.GetData(&oz);
-            tieSum = oz;
-            usedExistingOlp = true;
-            cprintf("Use existing OLP: %s tieSum=%d\n", strOlp, tieSum);
-        }
-        else {
+        //if (IsExist(strOlp) && olpF.Load4File(strOlp)) {
+        //    int oz = 0; olpF.GetData(&oz);
+        //    tieSum = oz;
+        //    usedExistingOlp = true;
+        //    cprintf("Use existing OLP: %s tieSum=%d\n", strOlp, tieSum);
+        //}
+        //else {
             // 无 .olp，执行匹配生成
             olpF.SetSize(0); rowsr = basImg.GetRows();
 
 #ifdef USE_OPENCV_MATCH
             // 计算重叠掩膜（像素域）
             cv::Mat maskDom, maskRef;
-            if (!BuildOverlapMasks(domImg, basImg, maskDom, maskRef, /*pad=*/128)) {
-                cprintf("No overlap, skip pair.\n");
-                continue;
+            // 仅当非绝对基准时才尝试 ORB；绝对基准用地理坐标采样
+            if (idx == -1) {
+                // —— 绝对基准：用地理坐标采样（复用非OpenCV分支的逻辑）——
+                rowsr = basImg.GetRows();
+                for (r = 1; r < rows - gs; r += gs) {
+                    for (c = 1; c < cols - gs; c += gs) {
+                        short* pC = (short*)(domImg.m_pImgDat + (r * cols + c) * pxSz);
+                        if (pC[0] == 0 && pC[1] == 0 && pC[2] == 0) continue;
+
+                        gx = domImg.m_tlX + c * domImg.m_dx;
+                        gy = domImg.m_tlY - (rows - 1 - r) * domImg.m_dy;
+                        gz = grdZ;
+                        if (!GetPxl(gx, gy, &domImg, cv, ws, &fc, &fr)) continue;
+                        if (cv[0] == 0 && cv[1] == 0 && cv[2] == 0) continue;
+                        if (!GetPxl(gx, gy, &basImg, rv, /*绝对基准时*/0, &fc1, &fr1)) continue;
+                        if (rv[0] == 0 && rv[1] == 0 && rv[2] == 0) continue;
+                        if (rv[0] < 0 || rv[1] < 0 || rv[2] < 0 || rv[3] < 0 || cv[0] < 0 || cv[1] < 0 || cv[2] < 0 || cv[3] < 0) {
+                            vSum++;
+                            continue;
+                        }
+                        //double corr = CalculateRadiationCorrelation(cv, rv);
+                        //if (corr < minCorr) {
+                        //    cSum++;
+                        //    continue;
+                        //}
+
+                        geoCvt.Cvt_Prj2LBH(gx, gy, gz, &lon, &lat, &hei);
+                        getSunPos(gx, gy, gz, cx, cy, cz, lon * SPGC_R2D, lat * SPGC_R2D, yy, mm, dd, ho, mi, se, &sz, &vz, &as);
+                        if (yy1 == 0) { sz1 = vz1 = as1 = 0; }
+                        else getSunPos(gx, gy, gz, cx1, cy1, cz1, lon * SPGC_R2D, lat * SPGC_R2D, yy1, mm1, dd1, ho1, mi1, se1, &sz1, &vz1, &as1);
+
+                        tieSum++;
+                        olpF.Append(sz, vz, as, int(fc), int(rows - 1 - fr), cv, sz1, vz1, as1, int(fc1), int(rowsr - 1 - fr1), rv);
+
+                        // 为可视化保存像素坐标（顶->下坐标系，绘图函数已做GSD归一）
+                        //plotDom.emplace_back((float)fc, (float)fr);
+                        //plotRef.emplace_back((float)fc1, (float)fr1);
+                    }
+                }
+                cprintf("Geo tieSum=%d, skip(value<=0)=%d corrSkip=%d\n", tieSum, vSum, cSum);
             }
-
-            // 像元尺度提示（>1 参考更粗，<1 参考更细）
-            double sHint = ComputeScaleHint(domImg, basImg);
-
-            // 多尺度 + 掩膜 匹配
-            ORBMatchResult fm = RunORBMatchMultiScale(domImg, basImg, sHint, &maskDom, &maskRef,
-                /*maxFeatures*/8000, /*scaleFactor*/1.2f,
-                /*nLevels*/8, /*ratio*/0.80f,
-                /*ransacThresh*/3.0, /*ransacConf*/0.999);
-            cprintf("ORB inliers = %zu\n", fm.ptsDom.size());
-
-            plotDom.reserve(fm.ptsDom.size()); plotRef.reserve(fm.ptsRef.size());
-
-            // 生成 .olp
-            for (size_t k = 0; k < fm.ptsDom.size(); ++k) {
-                float fc = fm.ptsDom[k].x;
-                float fr = fm.ptsDom[k].y;
-                float fc1 = fm.ptsRef[k].x;
-                float fr1 = fm.ptsRef[k].y;
-
-                if (fc < 0 || fr < 0 || fc >= cols || fr >= rows) continue;
-                if (fc1 < 0 || fr1 < 0 || fc1 >= basImg.GetCols() || fr1 >= rowsr) continue;
-
-                short cv[4] = { 0,0,0,0 }, rv[4] = { 0,0,0,0 };
-                const WORD* pD = (const WORD*)domImg.m_pImgDat + (INT64)int(fr) * cols * bnds + int(fc) * bnds;
-                const WORD* pR = (const WORD*)basImg.m_pImgDat + (INT64)int(fr1) * basImg.GetCols() * bnds + int(fc1) * bnds;
-                for (int b = 0; b < bnds && b < 4; b++) { cv[b] = (short)pD[b]; rv[b] = (short)pR[b]; }
-                if (cv[0] == 0 && cv[1] == 0 && cv[2] == 0) continue;
-                if (rv[0] == 0 && rv[1] == 0 && rv[2] == 0) continue;
-                if (rv[0] < 0 || rv[1] < 0 || rv[2] < 0 || rv[3] < 0 || cv[0] < 0 || cv[1] < 0 || cv[2] < 0 || cv[3] < 0) {
+            else {
+                // —— 非绝对基准：用 ORB 多尺度 + 掩膜 —— 
+                if (!BuildOverlapMasks(domImg, basImg, maskDom, maskRef, /*pad=*/128)) {
+                    cprintf("No overlap, skip pair.\n");
                     continue;
                 }
-                gx = domImg.m_tlX + fc * domImg.m_dx;
-                gy = domImg.m_tlY - (rows - 1 - fr) * domImg.m_dy;
-                gz = grdZ;
-                geoCvt.Cvt_Prj2LBH(gx, gy, gz, &lon, &lat, &hei);
-                getSunPos(gx, gy, gz, cx, cy, cz, lon * SPGC_R2D, lat * SPGC_R2D, yy, mm, dd, ho, mi, se, &sz, &vz, &as);
-                if (yy1 == 0) { sz1 = vz1 = as1 = 0; }
-                else getSunPos(gx, gy, gz, cx1, cy1, cz1, lon * SPGC_R2D, lat * SPGC_R2D, yy1, mm1, dd1, ho1, mi1, se1, &sz1, &vz1, &as1);
 
-                olpF.Append(sz, vz, as,
-                    int(fc), int(rows - 1 - fr), cv,
-                    sz1, vz1, as1,
-                    int(fc1), int(rowsr - 1 - fr1), rv);
-                plotDom.emplace_back(fc, fr);
-                plotRef.emplace_back(fc1, fr1);
-                tieSum++;
+                ORBMatchResult fm = RunORBMatch(domImg, basImg,
+                    /*maxFeatures*/40000, /*scaleFactor*/1.2f,
+                    /*nLevels*/8, /*ratio*/0.80f,
+                    /*ransacThresh*/3.0, /*ransacConf*/0.999,
+                    /*maskDom*/ &maskDom, /*maskRef*/ &maskRef);
+                cprintf("ORB inliers = %zu\n", fm.ptsDom.size());
+
+                //plotDom.reserve(fm.ptsDom.size()); plotRef.reserve(fm.ptsRef.size());
+
+                // 生成 .olp
+                for (size_t k = 0; k < fm.ptsDom.size(); ++k) {
+                    float fc = fm.ptsDom[k].x;
+                    float fr = fm.ptsDom[k].y;
+                    float fc1 = fm.ptsRef[k].x;
+                    float fr1 = fm.ptsRef[k].y;
+
+                    if (fc < 0 || fr < 0 || fc >= cols || fr >= rows) continue;
+                    if (fc1 < 0 || fr1 < 0 || fc1 >= basImg.GetCols() || fr1 >= rowsr) continue;
+
+                    short cv[4] = { 0,0,0,0 }, rv[4] = { 0,0,0,0 };
+                    const WORD* pD = (const WORD*)domImg.m_pImgDat + (INT64)int(fr) * cols * bnds + int(fc) * bnds;
+                    const WORD* pR = (const WORD*)basImg.m_pImgDat + (INT64)int(fr1) * basImg.GetCols() * bnds + int(fc1) * bnds;
+                    for (int b = 0; b < bnds && b < 4; b++) { cv[b] = (short)pD[b]; rv[b] = (short)pR[b]; }
+                    if (cv[0] == 0 && cv[1] == 0 && cv[2] == 0) continue;
+                    if (rv[0] == 0 && rv[1] == 0 && rv[2] == 0) continue;
+                    if (rv[0] < 0 || rv[1] < 0 || rv[2] < 0 || rv[3] < 0 || cv[0] < 0 || cv[1] < 0 || cv[2] < 0 || cv[3] < 0) {
+                        continue;
+                    }
+                    gx = domImg.m_tlX + fc * domImg.m_dx;
+                    gy = domImg.m_tlY - (rows - 1 - fr) * domImg.m_dy;
+                    gz = grdZ;
+                    geoCvt.Cvt_Prj2LBH(gx, gy, gz, &lon, &lat, &hei);
+                    getSunPos(gx, gy, gz, cx, cy, cz, lon * SPGC_R2D, lat * SPGC_R2D, yy, mm, dd, ho, mi, se, &sz, &vz, &as);
+                    if (yy1 == 0) { sz1 = vz1 = as1 = 0; }
+                    else getSunPos(gx, gy, gz, cx1, cy1, cz1, lon * SPGC_R2D, lat * SPGC_R2D, yy1, mm1, dd1, ho1, mi1, se1, &sz1, &vz1, &as1);
+
+                    olpF.Append(sz, vz, as,
+                        int(fc), int(rows - 1 - fr), cv,
+                        sz1, vz1, as1,
+                        int(fc1), int(rowsr - 1 - fr1), rv);
+                    //plotDom.emplace_back(fc, fr);
+                    //plotRef.emplace_back(fc1, fr1);
+                    tieSum++;
+                }
+                cprintf("ORB tieSum=%d\n", tieSum);
             }
-            cprintf("ORB tieSum=%d\n", tieSum);
-
 #else
             for (r = 1; r < rows - gs; r += gs) {
                 for (c = 1; c < cols - gs; c += gs) {
@@ -1932,23 +1898,21 @@ BOOL MchTie(LPCSTR lpstrPar)
             }
             cprintf("tieSum= %d, skip (value<=0)=%d correlation=%d\n", tieSum, vSum, cSum);
 #endif
-        }
+        //}
         if (olpF.GetSize() > 0) {
-            // 保存 .olp（二进制）
             olpF.Save2File(strOlp);
-            // 可选导出文本版
             if (bTxt) {
                 char strTxt[512]; strcpy(strTxt, strOlp); strcat(strTxt, ".txt");
                 olpF.Save2File(strTxt, FALSE);
             }
-#ifdef USE_OPENCV_MATCH
-            if (usedExistingOlp) {
-                SaveMatchesPlotFromOlp(domImg, basImg, olpF, strPlot);
-            }
-            else if (!plotDom.empty()) {
-                SaveMatchesPlotVec(domImg, basImg, plotDom, plotRef, strPlot);
-            }
-#endif
+//#ifdef USE_OPENCV_MATCH
+//            if (usedExistingOlp) {
+//                SaveMatchesPlotFromOlp(domImg, basImg, olpF, strPlot);
+//            }
+//            else if (!plotDom.empty()) {
+//                SaveMatchesPlotVec(domImg, basImg, plotDom, plotRef, strPlot);
+//            }
+//#endif
         }
     }
     fclose(fTsk);
