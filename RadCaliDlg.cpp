@@ -25,7 +25,14 @@
 #include "TMFile.hpp"
 #include "OlpFile.hpp"
 
-#define USE_EIGEN_BA 1
+#include <opencv2/opencv.hpp>
+//#include <opencv2/core.hpp>
+//#include <opencv2/imgproc.hpp>
+#include <opencv2/features2d.hpp>
+//#include <opencv2/calib3d.hpp>
+#pragma comment(lib,"opencv_imgproc490d.lib")
+//#define USE_EIGEN_BA 1
+#define USE_OPENCV_MATCH
 
 #ifdef _DEBUG
 #define new DEBUG_NEW
@@ -639,6 +646,16 @@ int comRI(const void *pA,const void *pB){
 
 void CRadCaliDlg::Process()
 {
+#ifndef ENABLE_OUTLIER_FILTER
+#define ENABLE_OUTLIER_FILTER 0          // 1 启用；0 关闭
+#endif
+#ifndef OUTLIER_SIGMA
+#define OUTLIER_SIGMA 3.0                // |l-mean| > 3σ 视为粗差
+#endif
+#ifndef MIN_OUTLIER_COUNT
+#define MIN_OUTLIER_COUNT 30             // 观测少于此数量不做剔除
+#endif
+
     gs_hWnd = m_hWnd;
 	m_hEThEHdl = ::CreateEvent( NULL,TRUE,FALSE,itostr( LONG(this) ) );
     
@@ -654,7 +671,7 @@ void CRadCaliDlg::Process()
     char *pS,strDir[256],strT[256],str[512];
     strcpy( strDir,m_strRet ); pS = strrchr( strDir,'\\' ); if (pS) *pS=0;
     
-    char strRom[256]; sprintf( strRom,"%s\\ROM_S2B",strDir );
+    char strRom[256]; sprintf( strRom,"%s\\ROM_S2Borb",strDir );
     CreateDir( strRom );
 
     char strLog[256]; strcpy( strLog,m_strRet );
@@ -798,65 +815,128 @@ void CRadCaliDlg::Process()
 
             memset( aa,0,sizeof(double)*(sum*4)*(sum*4) );
             memset( b,0,sizeof(double)*(sum*4) );
-            for( i=0;i<sum;i++,ProgStep(cancel) ){
-                if ( ::WaitForSingleObject(m_hEThEHdl,1)==WAIT_OBJECT_0 ) break;
+            for (i = 0; i < sum; i++, ProgStep(cancel)) {
+                if (::WaitForSingleObject(m_hEThEHdl, 1) == WAIT_OBJECT_0) break;
 
-                m_listCtrl.GetItemText(i,0,str,256);  print2Log("process[%d @ %d]: %s ",i+1,sum,strrchr(str,'\\') ); UINT ss = GetTickCount();
-                sprintf( strT,"%s%s.tsk",strRom,strrchr(str,'\\') );
+                m_listCtrl.GetItemText(i, 0, str, 256);  print2Log("process[%d @ %d]: %s ", i + 1, sum, strrchr(str, '\\')); UINT ss = GetTickCount();
+                sprintf(strT, "%s%s.tsk", strRom, strrchr(str, '\\'));
 
-                FILE *fTsk = fopen( strT,"rt" ); if (!fTsk) continue;
-                fgets( str,512,fTsk ); sscanf( str,"%s",strSrc ); DOS_PATH(strSrc);
-                fgets( str,512,fTsk ); sscanf( str,"%d",&idx );
-                while( !feof(fTsk) ){
-                    if ( !fgets( str,512,fTsk ) ) break;
-                    sscanf( str,"%s", strRef ); DOS_PATH(strRef); 
-                    if ( !fgets( str,512,fTsk ) ) break;     
-                    sscanf( str,"%d",&idxr );
-                    strcpy( strOlp,strT );  strcpy( strrchr(strOlp,'.'),"_" ); strcat( strOlp,strrchr(strRef,'\\')+1 ); strcat( strOlp,".olp" ); 
-                    if ( olpF.Load4File(strOlp) ){
-                        double k1,k2,k1r,k2r,l;
-                        int v,oz; OBV* pOs = olpF.GetData(&oz); cprintf("%s tieSum= %d\n",strOlp,oz );
-                        if ( idxr==-1 ){
-                            for( v=0;v<oz;v++,pOs++ ){
-                                k1 = getKval( 1,pOs->csz,pOs->cvz,pOs->cas );
-                                k2 = getKval( 4,pOs->csz,pOs->cvz,pOs->cas );
-                                k1 -= pAK1[idx]; k2 -= pAK2[idx];
-
-                                memset( a,0,sizeof(double)*(sum*4) );
-                                l = (pOs->rv[c]); // gb
-                                a[ idx *4 + 0] = -1;
-                                a[ idx *4 + 1] = -k1;
-                                a[ idx *4 + 2] = -k2;
-                                a[ idx *4 + 3] = pOs->cv[c]; // g1
-                                Nrml( a,(sum*4),l,aa,b,1 );
-                                    }
-                        }else{
-                            for( v=0;v<oz;v++,pOs++ ){
-                                k1  = getKval( 1,pOs->csz,pOs->cvz,pOs->cas );
-                                k2  = getKval( 4,pOs->csz,pOs->cvz,pOs->cas );
-                                k1  -= pAK1[idx ]; k2  -= pAK2[idx ];
-
-                                k1r = getKval( 1,pOs->rsz,pOs->rvz,pOs->ras );
-                                k2r = getKval( 4,pOs->rsz,pOs->rvz,pOs->ras );
-                                k1r -= pAK1[idxr]; k2r -= pAK2[idxr];
-
-                                memset( a,0,sizeof(double)*(sum*4) );
-                                l = pOs->cv[c] - pOs->rv[c]; // g1-g2
-                                a[ idx *4 + 0] = 1;
-                                a[ idx *4 + 1] = k1;
-                                a[ idx *4 + 2] = k2;
-                                a[ idx *4 + 3] = 0;
-                                a[ idxr*4 + 0] = -1;
-                                a[ idxr*4 + 1] = -k1r;
-                                a[ idxr*4 + 2] = -k2r;
-                                a[ idxr*4 + 3] = 0;
-                                Nrml( a,(sum*4),l,aa,b,0.1 );
+                FILE* fTsk = fopen(strT, "rt"); if (!fTsk) continue;
+                fgets(str, 512, fTsk); sscanf(str, "%s", strSrc); DOS_PATH(strSrc);
+                fgets(str, 512, fTsk); sscanf(str, "%d", &idx);
+                while (!feof(fTsk)) {
+                    if (!fgets(str, 512, fTsk)) break;
+                    sscanf(str, "%s", strRef); DOS_PATH(strRef);
+                    if (!fgets(str, 512, fTsk)) break;
+                    sscanf(str, "%d", &idxr);
+                    strcpy(strOlp, strT);  strcpy(strrchr(strOlp, '.'), "_"); strcat(strOlp, strrchr(strRef, '\\') + 1); strcat(strOlp, ".olp");
+                    if (olpF.Load4File(strOlp)) {
+                        double k1, k2, k1r, k2r, l;
+                        int v, oz; OBV* pOs = olpF.GetData(&oz); cprintf("%s tieSum= %d\n", strOlp, oz);
+#if ENABLE_OUTLIER_FILTER
+                        double sumL = 0.0, sumL2 = 0.0; int cntL = 0;
+                        {
+                            OBV* pAll = pOs;
+                            if (idxr == -1) {
+                                for (int vv = 0; vv < oz; ++vv) {
+                                    double lRaw = pAll[vv].rv[c];
+                                    if (lRaw != 0) { sumL += lRaw; sumL2 += lRaw * lRaw; cntL++; }
+                                }
+                            }
+                            else {
+                                for (int vv = 0; vv < oz; ++vv) {
+                                    double lRaw = pAll[vv].cv[c] - pAll[vv].rv[c];
+                                    sumL += lRaw; sumL2 += lRaw * lRaw; cntL++;
                                 }
                             }
                         }
+                        double meanL = 0, stdL = 0;
+                        bool doFilter = false;
+                        if (cntL >= MIN_OUTLIER_COUNT) {
+                            meanL = sumL / cntL;
+                            double varL = (sumL2 - sumL * sumL / cntL) / ((cntL > 1) ? (cntL - 1) : 1);
+                            if (varL > 0) stdL = sqrt(varL);
+                            if (stdL > 1e-9) doFilter = true;
+                        }
+                        int outlierCnt = 0, inlierCnt = 0;
+#endif
+                        if (idxr == -1) {
+                            pOs = olpF.GetData(&oz);
+                            for (v = 0; v < oz; v++, pOs++) {
+                                k1 = getKval(1, pOs->csz, pOs->cvz, pOs->cas);
+                                k2 = getKval(4, pOs->csz, pOs->cvz, pOs->cas);
+                                k1 -= pAK1[idx]; k2 -= pAK2[idx];
+
+                                memset(a, 0, sizeof(double) * (sum * 4));
+                                l = (pOs->rv[c]); // gb
+#if ENABLE_OUTLIER_FILTER
+                                if (doFilter) {
+                                    double lDev = l - meanL;
+                                    if (fabs(lDev) > OUTLIER_SIGMA * stdL) {
+                                        outlierCnt++;
+                                        continue; // 剔除
+                                    }
+                                }
+                                inlierCnt++;
+#endif
+                                a[idx * 4 + 0] = -1;
+                                a[idx * 4 + 1] = -k1;
+                                a[idx * 4 + 2] = -k2;
+                                a[idx * 4 + 3] = pOs->cv[c]; // g1
+                                Nrml(a, (sum * 4), l, aa, b, 1);
+                            }
+                        }
+                        else {
+                            pOs = olpF.GetData(&oz);
+                            for (v = 0; v < oz; v++, pOs++) {
+                                k1 = getKval(1, pOs->csz, pOs->cvz, pOs->cas);
+                                k2 = getKval(4, pOs->csz, pOs->cvz, pOs->cas);
+                                k1 -= pAK1[idx]; k2 -= pAK2[idx];
+
+                                k1r = getKval(1, pOs->rsz, pOs->rvz, pOs->ras);
+                                k2r = getKval(4, pOs->rsz, pOs->rvz, pOs->ras);
+                                k1r -= pAK1[idxr]; k2r -= pAK2[idxr];
+
+                                memset(a, 0, sizeof(double) * (sum * 4));
+                                l = pOs->cv[c] - pOs->rv[c]; // g1-g2
+#if ENABLE_OUTLIER_FILTER
+                                if (doFilter) {
+                                    double lDev = l - meanL;
+                                    if (fabs(lDev) > OUTLIER_SIGMA * stdL) {
+                                        outlierCnt++;
+                                        continue;
+                                    }
+                                }
+                                inlierCnt++;
+#endif
+                                a[idx * 4 + 0] = 1;
+                                a[idx * 4 + 1] = k1;
+                                a[idx * 4 + 2] = k2;
+                                a[idx * 4 + 3] = 0;
+                                a[idxr * 4 + 0] = -1;
+                                a[idxr * 4 + 1] = -k1r;
+                                a[idxr * 4 + 2] = -k2r;
+                                a[idxr * 4 + 3] = 0;
+                                Nrml(a, (sum * 4), l, aa, b, 0.1);
+                            }
+                        }
+#if ENABLE_OUTLIER_FILTER
+                        if (cntL >= MIN_OUTLIER_COUNT) {
+                            print2Log("  olp=%s total=%d inlier=%d outlier=%d mean=%.3lf std=%.3lf sigma=%.1f\n",
+                                strrchr(strOlp, '\\') ? strrchr(strOlp, '\\') + 1 : strOlp,
+                                cntL, inlierCnt, outlierCnt, meanL, stdL, OUTLIER_SIGMA);
+                        }
+                        else {
+                            print2Log("  olp=%s total=%d (skip outlier filter: cnt<%d)\n",
+                                strrchr(strOlp, '\\') ? strrchr(strOlp, '\\') + 1 : strOlp,
+                                cntL, MIN_OUTLIER_COUNT);
+                        }
+#endif
                     }
-                print2Log(", used tm= %.2lf sec \n",(GetTickCount()-ss)*0.001 );
                 }
+                fclose(fTsk);
+                print2Log(", used tm= %.2lf sec \n", (GetTickCount() - ss) * 0.001);
+            }
             print2Log("Norml ...over. tm= %.2lf sec \nSolve ... st= %d \n",(GetTickCount()-st)*0.001,GetTickCount() ); 
 
             memset( x,0,sizeof(double)*(sum*4) );  st = GetTickCount();
@@ -906,7 +986,7 @@ void CRadCaliDlg::ProcessWithEigen()
     char* pS, strDir[256], strT[256], str[512];
     strcpy(strDir, m_strRet); pS = strrchr(strDir, '\\'); if (pS) *pS = 0;
 
-    char strRom[256]; sprintf(strRom, "%s\\ROM_S2B", strDir);
+    char strRom[256]; sprintf(strRom, "%s\\ROM_S2Bexp", strDir);
     CreateDir(strRom);
 
     char strLog[256]; strcpy(strLog, m_strRet);
@@ -1303,7 +1383,6 @@ static bool GetPxl(double gx,double gy,CWuErsImage *pImg,short *pv,int gs,double
 
 // 辐射相关性计算函数
 static inline double CalculateRadiationCorrelation(short cv[4], short rv[4]) {
-    // 计算多波段相关系数
     double sum1 = 0, sum2 = 0, sum11 = 0, sum22 = 0, sum12 = 0;
     int valid_bands = 0;
 
@@ -1327,162 +1406,550 @@ static inline double CalculateRadiationCorrelation(short cv[4], short rv[4]) {
     return fabs(denominator) > 1e-6 ? numerator / denominator : 0;
 }
 
-// 光谱差异计算函数
-static inline double CalculateSpectralDifference(short cv[4], short rv[4]) {
-    // 计算归一化光谱角距离
-    double dot_product = 0, norm1 = 0, norm2 = 0;
-    int valid_bands = 0;
+// 计算主/参考的像元尺度比（>1 表示参考更粗，需要下采主影像）
+static inline double ComputeScaleHint(const CWuErsImage& domImg, const CWuErsImage& refImg)
+{
+    double sx = fabs(refImg.m_dx / domImg.m_dx);
+    double sy = fabs(refImg.m_dy / domImg.m_dy);
+    if (!std::isfinite(sx) || sx <= 0) sx = 1.0;
+    if (!std::isfinite(sy) || sy <= 0) sy = 1.0;
+    return 0.5 * (sx + sy);
+}
+// ========== 计算重叠掩膜（像素坐标） ==========
+static inline bool BuildOverlapMasks(CWuErsImage& dom,
+    CWuErsImage& ref,
+    cv::Mat& maskDom,
+    cv::Mat& maskRef,
+    int pad = 16)
+{
+    // dom世界范围
+    const double d_left = dom.m_tlX;
+    const double d_right = dom.m_tlX + (dom.GetCols() - 1) * dom.m_dx;
+    const double d_top = dom.m_tlY;
+    const double d_bottom = dom.m_tlY - (dom.GetRows() - 1) * dom.m_dy;
+    // ref世界范围
+    const double r_left = ref.m_tlX;
+    const double r_right = ref.m_tlX + (ref.GetCols() - 1) * ref.m_dx;
+    const double r_top = ref.m_tlY;
+    const double r_bottom = ref.m_tlY - (ref.GetRows() - 1) * ref.m_dy;
 
-    for (int b = 0; b < 4; b++) {
-        if (cv[b] > 0 && rv[b] > 0) {
-            dot_product += cv[b] * rv[b];
-            norm1 += cv[b] * cv[b];
-            norm2 += rv[b] * rv[b];
-            valid_bands++;
-        }
+    // 交集（世界坐标）
+    const double wxmin = std::max(d_left, r_left);
+    const double wxmax = std::min(d_right, r_right);
+    const double wymax = std::min(d_top, r_top);
+    const double wymin = std::max(d_bottom, r_bottom);
+    if (!(wxmin < wxmax && wymin < wymax)) {
+        maskDom = cv::Mat(); maskRef = cv::Mat();
+        return false;
     }
 
-    if (valid_bands < 2) return 1.0; // 最大差异
+    // 世界->像素（列：x方向；行：自上而下）
+    auto clamp = [](int v, int lo, int hi) { return std::max(lo, std::min(hi, v)); };
 
-    double spectral_angle = acos(dot_product / (sqrt(norm1) * sqrt(norm2)));
-    return spectral_angle / (PI / 2); // 归一化到[0,1]
+    // dom像素矩形
+    int d_cL = (int)std::floor((wxmin - dom.m_tlX) / dom.m_dx) - pad;
+    int d_cR = (int)std::ceil((wxmax - dom.m_tlX) / dom.m_dx) + pad;
+    int d_rT = (int)std::floor((dom.m_tlY - wymax) / dom.m_dy) - pad; // 注意顶->小行号
+    int d_rB = (int)std::ceil((dom.m_tlY - wymin) / dom.m_dy) + pad;
+
+    d_cL = clamp(d_cL, 0, dom.GetCols() - 1);
+    d_cR = clamp(d_cR, 0, dom.GetCols() - 1);
+    d_rT = clamp(d_rT, 0, dom.GetRows() - 1);
+    d_rB = clamp(d_rB, 0, dom.GetRows() - 1);
+    if (d_cL >= d_cR || d_rT >= d_rB) {
+        maskDom = cv::Mat(); maskRef = cv::Mat();
+        return false;
+    }
+
+    // ref像素矩形
+    int r_cL = (int)std::floor((wxmin - ref.m_tlX) / ref.m_dx) - pad;
+    int r_cR = (int)std::ceil((wxmax - ref.m_tlX) / ref.m_dx) + pad;
+    int r_rT = (int)std::floor((ref.m_tlY - wymax) / ref.m_dy) - pad;
+    int r_rB = (int)std::ceil((ref.m_tlY - wymin) / ref.m_dy) + pad;
+
+    r_cL = clamp(r_cL, 0, ref.GetCols() - 1);
+    r_cR = clamp(r_cR, 0, ref.GetCols() - 1);
+    r_rT = clamp(r_rT, 0, ref.GetRows() - 1);
+    r_rB = clamp(r_rB, 0, ref.GetRows() - 1);
+    if (r_cL >= r_cR || r_rT >= r_rB) {
+        maskDom = cv::Mat(); maskRef = cv::Mat();
+        return false;
+    }
+
+    maskDom = cv::Mat::zeros(dom.GetRows(), dom.GetCols(), CV_8U);
+    maskRef = cv::Mat::zeros(ref.GetRows(), ref.GetCols(), CV_8U);
+    cv::rectangle(maskDom, cv::Rect(d_cL, d_rT, d_cR - d_cL + 1, d_rB - d_rT + 1), cv::Scalar(255), cv::FILLED);
+    cv::rectangle(maskRef, cv::Rect(r_cL, r_rT, r_cR - r_cL + 1, r_rB - r_rT + 1), cv::Scalar(255), cv::FILLED);
+    return true;
 }
 
-static inline double BandMean(const short v[4], int& valid) {
-    double s = 0; valid = 0;
-    for (int i = 0; i < 4; i++) { if (v[i] > 0) { s += v[i]; valid++; } }
-    return valid ? s / valid : 0.0;
+#ifdef USE_OPENCV_MATCH
+static void WuErsToGray8(CWuErsImage& img, cv::Mat& outGray)
+{
+    int cols = img.GetCols();
+    int rows = img.GetRows();
+    int bands = img.GetBands();
+    const WORD* pSrc = (const WORD*)img.m_pImgDat;
+    outGray.create(rows, cols, CV_8U);
+    for (int r = 0; r < rows; ++r) {
+        const WORD* rowPtr = pSrc + (INT64)r * cols * bands;
+        uint8_t* gPtr = outGray.ptr<uint8_t>(r);
+        for (int c = 0; c < cols; ++c) {
+            const WORD* px = rowPtr + c * bands;
+            uint32_t s = 0; int valid = 0;
+            for (int b = 0; b < bands && b < 3; b++) {
+                if (px[b] > 0) { s += px[b]; valid++; }
+            }
+            if (valid == 0) { gPtr[c] = 0; }
+            else {
+                WORD v = (WORD)(s / valid);
+                gPtr[c] = (uint8_t)(v >> 8); // 16→8
+            }
+        }
+    }
 }
-static inline double BandVar(const short v[4]) {
-    int valid = 0; double m = BandMean(v, valid); if (valid < 2) return 0;
-    double s = 0; for (int i = 0; i < 4; i++) if (v[i] > 0) s += (v[i] - m) * (v[i] - m);
-    return s / (valid - 1);
+// 从 .olp 绘制匹配连线图（.png）
+static void SaveMatchesPlotFromOlp(CWuErsImage& domImg,
+    CWuErsImage& refImg,
+    COlpFile& olp,
+    const char* outPath)
+{
+    int oz = 0; const OBV* p = olp.GetData(&oz);
+    if (!p || oz <= 0) return;
+
+    cv::Mat gL0, gR0;
+    WuErsToGray8(domImg, gL0);
+    WuErsToGray8(refImg, gR0);
+
+    // 基于像元大小做显示尺度归一：统一到较粗分辨率
+    const double gsdL = std::abs(domImg.m_dx);
+    const double gsdR = std::abs(refImg.m_dx);
+    const double gsdCoarse = std::max(gsdL, gsdR);
+    double sL = (gsdL > 0) ? (gsdL / gsdCoarse) : 1.0; // <=1
+    double sR = (gsdR > 0) ? (gsdR / gsdCoarse) : 1.0; // <=1
+    // 避免宽或高为0
+    auto safeSize = [](int v, double s) { return std::max(1, (int)std::round(v * s)); };
+
+    cv::Mat gL, gR;
+    cv::resize(gL0, gL, cv::Size(safeSize(gL0.cols, sL), safeSize(gL0.rows, sL)), 0, 0, cv::INTER_AREA);
+    cv::resize(gR0, gR, cv::Size(safeSize(gR0.cols, sR), safeSize(gR0.rows, sR)), 0, 0, cv::INTER_AREA);
+
+    const int WL = gL.cols, WR = gR.cols;
+    const int H = std::max(gL.rows, gR.rows);
+
+    cv::Mat canvas(H, WL + WR, CV_8UC3, cv::Scalar(0, 0, 0));
+    cv::Mat roiL = canvas(cv::Rect(0, 0, WL, gL.rows));
+    cv::Mat roiR = canvas(cv::Rect(WL, 0, WR, gR.rows));
+    cv::cvtColor(gL, roiL, cv::COLOR_GRAY2BGR);
+    cv::cvtColor(gR, roiR, cv::COLOR_GRAY2BGR);
+
+    cv::RNG rng(12345);
+    for (int i = 0; i < oz; ++i, ++p) {
+        // .olp 存的是底->上的行号，这里转回顶->下，再乘以显示缩放
+        double rL_top = (gL0.rows - 1 - p->cr) * sL;
+        double rR_top = (gR0.rows - 1 - p->rr) * sR;
+        double cL_s = p->cc * sL;
+        double cR_s = p->rc * sR;
+
+        if (cL_s < 0 || rL_top < 0 || cL_s >= WL || rL_top >= gL.rows) continue;
+        if (cR_s < 0 || rR_top < 0 || cR_s >= WR || rR_top >= gR.rows) continue;
+
+        cv::Point2f pL((float)cL_s, (float)rL_top);
+        cv::Point2f pR((float)(cR_s + WL), (float)rR_top);
+
+        cv::Scalar col(rng.uniform(0, 255), rng.uniform(0, 255), rng.uniform(0, 255));
+        cv::circle(canvas, pL, 2, col, -1, cv::LINE_AA);
+        cv::circle(canvas, pR, 2, col, -1, cv::LINE_AA);
+        cv::line(canvas, pL, pR, col, 1, cv::LINE_AA);
+    }
+    cv::imwrite(outPath, canvas);
 }
+
+static void SaveMatchesPlotVec(CWuErsImage& domImg,
+    CWuErsImage& refImg,
+    const std::vector<cv::Point2f>& ptsDom,
+    const std::vector<cv::Point2f>& ptsRef,
+    const char* outPath)
+{
+    if (ptsDom.empty() || ptsDom.size() != ptsRef.size()) return;
+
+    cv::Mat gL0, gR0;
+    WuErsToGray8(domImg, gL0);
+    WuErsToGray8(refImg, gR0);
+
+    const double gsdL = std::abs(domImg.m_dx);
+    const double gsdR = std::abs(refImg.m_dx);
+    const double gsdCoarse = std::max(gsdL, gsdR);
+    double sL = (gsdL > 0) ? (gsdL / gsdCoarse) : 1.0;
+    double sR = (gsdR > 0) ? (gsdR / gsdCoarse) : 1.0;
+    auto safeSize = [](int v, double s) { return std::max(1, (int)std::round(v * s)); };
+
+    cv::Mat gL, gR;
+    cv::resize(gL0, gL, cv::Size(safeSize(gL0.cols, sL), safeSize(gL0.rows, sL)), 0, 0, cv::INTER_AREA);
+    cv::resize(gR0, gR, cv::Size(safeSize(gR0.cols, sR), safeSize(gR0.rows, sR)), 0, 0, cv::INTER_AREA);
+
+    const int WL = gL.cols, WR = gR.cols;
+    const int H = std::max(gL.rows, gR.rows);
+
+    cv::Mat canvas(H, WL + WR, CV_8UC3, cv::Scalar(0, 0, 0));
+    cv::Mat roiL = canvas(cv::Rect(0, 0, WL, gL.rows));
+    cv::Mat roiR = canvas(cv::Rect(WL, 0, WR, gR.rows));
+    cv::cvtColor(gL, roiL, cv::COLOR_GRAY2BGR);
+    cv::cvtColor(gR, roiR, cv::COLOR_GRAY2BGR);
+
+    cv::RNG rng(12345);
+    for (size_t i = 0; i < ptsDom.size(); ++i) {
+        cv::Point2f pL(ptsDom[i].x * (float)sL, ptsDom[i].y * (float)sL);
+        cv::Point2f pR(ptsRef[i].x * (float)sR + WL, ptsRef[i].y * (float)sR);
+
+        if (pL.x < 0 || pL.y < 0 || pL.x >= WL || pL.y >= gL.rows) continue;
+        if (pR.x < WL || pR.y < 0 || pR.x >= WL + WR || pR.y >= gR.rows) continue;
+
+        cv::Scalar col(rng.uniform(0, 255), rng.uniform(0, 255), rng.uniform(0, 255));
+        cv::circle(canvas, pL, 2, col, -1, cv::LINE_AA);
+        cv::circle(canvas, pR, 2, col, -1, cv::LINE_AA);
+        cv::line(canvas, pL, pR, col, 1, cv::LINE_AA);
+    }
+    cv::imwrite(outPath, canvas);
+}
+
+struct ORBMatchResult {
+    std::vector<cv::Point2f> ptsDom; // 主影像
+    std::vector<cv::Point2f> ptsRef; // 参考影像
+};
+
+static ORBMatchResult RunORBMatch(CWuErsImage& domImg,
+    CWuErsImage& refImg,
+    int maxFeatures = 6000,
+    float scaleFactor = 1.2f,
+    int nLevels = 8,
+    float ratio = 0.75f,
+    double ransacThresh = 2.0,
+    double ransacConf = 0.999)
+{
+    ORBMatchResult res;
+
+    cv::Mat gDom, gRef;
+    WuErsToGray8(domImg, gDom);
+    WuErsToGray8(refImg, gRef);
+
+    cv::Ptr<cv::ORB> orb = cv::ORB::create(maxFeatures, scaleFactor, nLevels);
+    std::vector<cv::KeyPoint> kptsDom, kptsRef;
+    cv::Mat descDom, descRef;
+    orb->detectAndCompute(gDom, cv::noArray(), kptsDom, descDom);
+    orb->detectAndCompute(gRef, cv::noArray(), kptsRef, descRef);
+    if (descDom.empty() || descRef.empty()) return res;
+
+    cv::BFMatcher matcher(cv::NORM_HAMMING, false);
+    std::vector<std::vector<cv::DMatch>> knn;
+    matcher.knnMatch(descDom, descRef, knn, 2);
+
+    std::vector<cv::Point2f> q1, q2;
+    q1.reserve(knn.size());
+    q2.reserve(knn.size());
+
+    for (auto& k : knn) {
+        if (k.size() < 2) continue;
+        if (k[0].distance < ratio * k[1].distance) {
+            q1.push_back(kptsDom[k[0].queryIdx].pt);
+            q2.push_back(kptsRef[k[0].trainIdx].pt);
+        }
+    }
+    if (q1.size() < 8) return res;
+
+    std::vector<unsigned char> inlierMask;
+    cv::Mat F = cv::findFundamentalMat(q1, q2, cv::FM_RANSAC, ransacThresh, ransacConf, inlierMask);
+    if (F.empty()) return res;
+
+    for (size_t i = 0; i < q1.size(); ++i) {
+        if (inlierMask[i]) {
+            res.ptsDom.push_back(q1[i]);
+            res.ptsRef.push_back(q2[i]);
+        }
+    }
+    return res;
+}
+
+// 用掩膜的多尺度 ORB
+static ORBMatchResult RunORBMatchMultiScale(const CWuErsImage& domImg,
+    const CWuErsImage& refImg,
+    double sHint,                 // ≈ ref_dx/dom_dx
+    const cv::Mat* maskDom = nullptr,
+    const cv::Mat* maskRef = nullptr,
+    int   maxFeatures = 6000,
+    float scaleFactor = 1.2f,
+    int   nLevels = 8,
+    float ratio = 0.75f,
+    double ransacThresh = 2.0,
+    double ransacConf = 0.999)
+{
+    ORBMatchResult res;
+
+    // 1) 转灰度
+    cv::Mat gDom, gRef;
+    WuErsToGray8((CWuErsImage&)domImg, gDom);
+    WuErsToGray8((CWuErsImage&)refImg, gRef);
+
+    // 2) 仅按像元比在一侧做缩放（参考更粗则缩主图；参考更细则缩参考图；接近则不缩）
+    cv::Mat domUse = gDom.clone(), refUse = gRef.clone();
+    cv::Mat mdUse, mrUse;
+    double mapDom = 1.0, mapRef = 1.0;
+
+    if (sHint > 1.2) {
+        // 参考像元更大：下采主图
+        double sf = 1.0 / std::min(std::max(sHint, 0.25), 8.0);
+        cv::resize(gDom, domUse, cv::Size(), sf, sf, cv::INTER_AREA);
+        mapDom = 1.0 / sf;
+        if (maskDom && !maskDom->empty())
+            cv::resize(*maskDom, mdUse, domUse.size(), 0, 0, cv::INTER_NEAREST);
+        if (maskRef && !maskRef->empty())
+            mrUse = *maskRef; // 参考不缩，掩膜原尺寸
+    }
+    else if (sHint < 0.8) {
+        // 参考像元更小：下采参考图
+        double sf = std::min(std::max(sHint, 0.25), 1.0);
+        cv::resize(gRef, refUse, cv::Size(), sf, sf, cv::INTER_AREA);
+        mapRef = 1.0 / sf;
+        if (maskRef && !maskRef->empty())
+            cv::resize(*maskRef, mrUse, refUse.size(), 0, 0, cv::INTER_NEAREST);
+        if (maskDom && !maskDom->empty())
+            mdUse = *maskDom; // 主图不缩，掩膜原尺寸
+    }
+    else {
+        // 尺度接近：不缩放
+        if (maskDom) mdUse = *maskDom;
+        if (maskRef) mrUse = *maskRef;
+    }
+
+    // 3) 简单增强以提升角点质量（可选）
+    cv::equalizeHist(domUse, domUse);
+    cv::equalizeHist(refUse, refUse);
+
+    // 4) ORB 检测与描述
+    cv::Ptr<cv::ORB> orb = cv::ORB::create(maxFeatures, scaleFactor, nLevels);
+    std::vector<cv::KeyPoint> kptsDom, kptsRef;
+    cv::Mat descDom, descRef;
+    orb->detectAndCompute(domUse, (mdUse.empty() ? cv::noArray() : cv::InputArray(mdUse)), kptsDom, descDom);
+    orb->detectAndCompute(refUse, (mrUse.empty() ? cv::noArray() : cv::InputArray(mrUse)), kptsRef, descRef);
+    if (descDom.empty() || descRef.empty()) return res;
+
+    // 5) KNN + ratio test
+    cv::BFMatcher matcher(cv::NORM_HAMMING, false);
+    std::vector<std::vector<cv::DMatch>> knn;
+    matcher.knnMatch(descDom, descRef, knn, 2);
+
+    std::vector<cv::Point2f> q1, q2;
+    q1.reserve(knn.size()); q2.reserve(knn.size());
+    for (auto& k : knn) {
+        if (k.size() < 2) continue;
+        if (k[0].distance < ratio * k[1].distance) {
+            q1.push_back(kptsDom[k[0].queryIdx].pt);
+            q2.push_back(kptsRef[k[0].trainIdx].pt);
+        }
+    }
+    if (q1.size() < 8) return res;
+
+    // 6) RANSAC 估计基础矩阵
+    std::vector<unsigned char> inlierMask;
+    cv::Mat F = cv::findFundamentalMat(q1, q2, cv::FM_RANSAC, ransacThresh, ransacConf, inlierMask);
+    if (F.empty()) return res;
+
+    // 7) 映射回原始像素坐标
+    for (size_t i = 0; i < q1.size(); ++i) {
+        if (!inlierMask[i]) continue;
+        res.ptsDom.emplace_back(q1[i].x * mapDom, q1[i].y * mapDom);
+        res.ptsRef.emplace_back(q2[i].x * mapRef, q2[i].y * mapRef);
+    }
+    return res;
+}
+#endif
 
 BOOL MchTie(LPCSTR lpstrPar)
 {
-    char strSrc[256],strRef[256],strTsk[256],str[512],strOlp[512];
-    double fc,fr,fc1,fr1,sz,vz,as,sz1,vz1,as1;
-    double cx,cy,cz,phi,img,kap,grdZ,cx1,cy1,cz1,phi1,img1,kap1,grdZ1; 
-    int idx,yy,mm,dd,ho,mi,se,yy1,mm1,dd1,ho1,mi1,se1,utmZn=0,gs=21,ws=5,bTxt=0;
+    char strSrc[256], strRef[256], strTsk[256], str[512], strOlp[512];
+    double fc, fr, fc1, fr1, sz, vz, as, sz1, vz1, as1;
+    double cx, cy, cz, phi, img, kap, grdZ, cx1, cy1, cz1, phi1, img1, kap1, grdZ1;
+    int idx, yy, mm, dd, ho, mi, se, yy1, mm1, dd1, ho1, mi1, se1, utmZn = 0, gs = 21, ws = 5, bTxt = 0;
 
     double minCorr = 0.7;    // 辐射相关性最小阈值
-    double maxSpecDiff = 0.3;  // 光谱差异最大阈值
 
-    const char *pS = strrchr(lpstrPar,'@'); if ( pS ){ pS++; while( *pS==' ' ) pS++; }else pS = lpstrPar; strcpy( strTsk,pS );
-    FILE *fTsk = fopen( strTsk,"rt" );
-    fgets( str,512,fTsk ); sscanf( str,"%s",strSrc ); DOS_PATH(strSrc);
-    fgets( str,512,fTsk ); sscanf( str,"%d%lf%lf%lf%lf%lf%lf%lf%d%d%d%d%d%d%d%d%d%d",&idx, &cx, &cy, &cz,&phi,&img,&kap, &grdZ, &yy, &mm, &dd, &ho, &mi, &se,&utmZn,&gs,&ws,&bTxt );
-    
-    CWuErsImage domImg,basImg; strcat( strSrc,".ers" );
-    if ( !domImg.Load4File(strSrc) ) return FALSE;
+    const char* pS = strrchr(lpstrPar, '@'); if (pS) { pS++; while (*pS == ' ') pS++; }
+    else pS = lpstrPar; strcpy(strTsk, pS);
+    FILE* fTsk = fopen(strTsk, "rt");
+    fgets(str, 512, fTsk); sscanf(str, "%s", strSrc); DOS_PATH(strSrc);
+    fgets(str, 512, fTsk); sscanf(str, "%d%lf%lf%lf%lf%lf%lf%lf%d%d%d%d%d%d%d%d%d%d", &idx, &cx, &cy, &cz, &phi, &img, &kap, &grdZ, &yy, &mm, &dd, &ho, &mi, &se, &utmZn, &gs, &ws, &bTxt);
+
+    CWuErsImage domImg, basImg; strcat(strSrc, ".ers");
+    if (!domImg.Load4File(strSrc)) return FALSE;
     int cols = domImg.GetCols();
     int rows = domImg.GetRows();
     int bnds = domImg.GetBands();
-    int pxSz = domImg.PxByte( domImg.GetPxType() )*bnds;
-    double gx,gy,gz,lon,lat,hei; short cv[4],rv[4]; 
-    double avK1=0,avK2=0,ks=0; int r,c,rowsr; CWuGeoCvt geoCvt; 
-    geoCvt.Set_Cvt_Par( ET_WGS84,UTM_PROJECTION,SEMIMAJOR_WGS84,SEMIMINOR_WGS84,0,Zone2CenterMerdian(utmZn)*SPGC_D2R,500000,0,0.9996,0 );
+    int pxSz = domImg.PxByte(domImg.GetPxType()) * bnds;
+    double gx, gy, gz, lon, lat, hei; short cv[4], rv[4];
+    double avK1 = 0, avK2 = 0, ks = 0; int r, c, rowsr; CWuGeoCvt geoCvt;
+    geoCvt.Set_Cvt_Par(ET_WGS84, UTM_PROJECTION, SEMIMAJOR_WGS84, SEMIMINOR_WGS84, 0, Zone2CenterMerdian(utmZn) * SPGC_D2R, 500000, 0, 0.9996, 0);
 
     ////// Cal avK1 avK2
-    strcpy( str,strTsk ); strcat( str,"_skm.txt" );
-    FILE *fKM = fopen( str,"wt" );
-    if ( fKM ){
-#pragma omp parallel for reduction(+:avK1, avK2, ks) schedule(dynamic)
-        for( r=1;r<rows-gs;r+=gs ){
-            for(  c=1;c<cols-gs;c+=gs ){
-                short *pC = (short*)(domImg.m_pImgDat+ (r*cols+c)* pxSz);
-                    if ( pC[0]==0 && pC[1]==0 && pC[2]==0 ) continue;
-            
-                    gx = domImg.m_tlX + c*domImg.m_dx;
-                    gy = domImg.m_tlY - (rows-1-r)*domImg.m_dy;
-                    gz = grdZ; 
-                    geoCvt.Cvt_Prj2LBH( gx,gy,gz,&lon,&lat,&hei ); 
-                    getSunPos( gx,gy,gz,cx,cy,cz,lon*SPGC_R2D,lat*SPGC_R2D,yy,mm,dd,ho,mi,se,&sz,&vz,&as );
-#pragma omp atomic
-                    avK1 += getKval( 1,sz,vz,as );
-#pragma omp atomic
-                    avK2 += getKval( 4,sz,vz,as );
-#pragma omp atomic
-                    ks += 1;
+    strcpy(str, strTsk); strcat(str, "_skm.txt");
+    FILE* fKM = fopen(str, "wt");
+    if (fKM) {
+        for (r = 1; r < rows - gs; r += gs) {
+            for (c = 1; c < cols - gs; c += gs) {
+                short* pC = (short*)(domImg.m_pImgDat + (r * cols + c) * pxSz);
+                if (pC[0] == 0 && pC[1] == 0 && pC[2] == 0) continue;
+
+                gx = domImg.m_tlX + c * domImg.m_dx;
+                gy = domImg.m_tlY - (rows - 1 - r) * domImg.m_dy;
+                gz = grdZ;
+                geoCvt.Cvt_Prj2LBH(gx, gy, gz, &lon, &lat, &hei);
+                getSunPos(gx, gy, gz, cx, cy, cz, lon * SPGC_R2D, lat * SPGC_R2D, yy, mm, dd, ho, mi, se, &sz, &vz, &as);
+                avK1 += getKval(1, sz, vz, as);
+                avK2 += getKval(4, sz, vz, as);
+                ks += 1;
             }
         }
         avK1 /= ks; avK2 /= ks;
-        cprintf("avK1 = %lf avK2 = %lf\n",avK1,avK2 );
+        cprintf("avK1 = %lf avK2 = %lf\n", avK1, avK2);
 
-        fprintf( fKM,"%lf %lf \n",avK1,avK2 );
+        fprintf(fKM, "%lf %lf \n", avK1, avK2);
         fclose(fKM);
     }
 
-    COlpFile olpF; 
-    while( !feof(fTsk) ){
-        if ( !fgets( str,512,fTsk ) ) break;
-        sscanf( str,"%s", strRef ); 
-        if ( !fgets( str,512,fTsk ) ) break;
-        if ( sscanf(str, "%d%lf%lf%lf%lf%lf%lf%lf%d%d%d%d%d%d", &idx,&cx1, &cy1, &cz1,&phi1,&img1,&kap1, &grdZ1, &yy1, &mm1, &dd1, &ho1, &mi1, &se1 )<10 ) break;
+    COlpFile olpF;
+    while (!feof(fTsk)) {
+        if (!fgets(str, 512, fTsk)) break;
+        sscanf(str, "%s", strRef);
+        if (!fgets(str, 512, fTsk)) break;
+        if (sscanf(str, "%d%lf%lf%lf%lf%lf%lf%lf%d%d%d%d%d%d", &idx, &cx1, &cy1, &cz1, &phi1, &img1, &kap1, &grdZ1, &yy1, &mm1, &dd1, &ho1, &mi1, &se1) < 10) break;
 
-        DOS_PATH(strRef); strcpy( strOlp,strTsk );  strcpy( strrchr(strOlp,'.'),"_" ); strcat( strOlp,strrchr(strRef,'\\')+1 ); strcat( strOlp,".olp" );  cprintf("%s\n",strOlp);      
-        strcat( strRef,".ers" ); if ( !basImg.Load4File(strRef) ) continue;
+        DOS_PATH(strRef); strcpy(strOlp, strTsk);  strcpy(strrchr(strOlp, '.'), "_"); strcat(strOlp, strrchr(strRef, '\\') + 1); strcat(strOlp, ".olp");  cprintf("%s\n", strOlp);
+        strcat(strRef, ".ers"); if (!basImg.Load4File(strRef)) continue;
 
-        olpF.SetSize(0); rowsr = basImg.GetRows();
-		int tieSum=0, vSum = 0, cSum = 0, sSum = 0, varSum = 0;
+        char strPlot[512]; strcpy(strPlot, strOlp);
+        char* pExtPng = strrchr(strPlot, '.'); if (pExtPng) strcpy(pExtPng, ".png"); else strcat(strPlot, ".png");
+        int tieSum = 0, vSum = 0, cSum = 0;
+        bool usedExistingOlp = false;
+        std::vector<cv::Point2f> plotDom, plotRef; // 非现有 .olp 流程用于绘图
 
-        COlpFile local_olpF;
-        local_olpF.SetSize(0);
-#pragma omp parallel for schedule(dynamic) collapse(2)
-        for( r=1;r<rows-gs;r+=gs ){
-            for(  c=1;c<cols-gs;c+=gs ){
-                short *pC = (short*)(domImg.m_pImgDat+ (r*cols+c)* pxSz);
-                if ( pC[0]==0 && pC[1]==0 && pC[2]==0 ) continue;
-
-                gx = domImg.m_tlX + c*domImg.m_dx;
-                gy = domImg.m_tlY - (rows-1-r)*domImg.m_dy;
-                gz = grdZ;                
-                if ( !GetPxl(gx,gy,&domImg,cv,ws,&fc ,&fr ) ) continue;
-                if ( cv[0]==0 && cv[1]==0 && cv[2]==0 ) continue;
-                if ( !GetPxl(gx,gy,&basImg,rv,(yy1==0)?0:ws,&fc1,&fr1) ) continue;
-                if ( rv[0]==0 && rv[1]==0 && rv[2]==0 ) continue;
-                if (rv[0] < 0 || rv[1] < 0 || rv[2] < 0 || rv[3] < 0 || cv[0] < 0 || cv[1] < 0 || cv[2] < 0 || cv[3] < 0) {
-                    vSum++;
-                    continue;
-                }
-                // 1. 辐射一致性检查
-                double corr = CalculateRadiationCorrelation(cv, rv);
-                if (corr < minCorr) {
-					cSum++;
-                    continue;
-                }
-     //           // 2. 光谱特征一致性检查
-     //           double specDiff = CalculateSpectralDifference(cv, rv);
-     //           if (specDiff > maxSpecDiff) {
-     //               sSum++;
-     //               continue;
-     //           }
-     //           double varC = BandVar(cv);
-     //           double varR = BandVar(rv);
-     //           if (varC < 30 || varR < 30) {
-     //               varSum++;
-     //               continue; // 低纹理点剔除 (阈值可调)
-     //           }
-
-                geoCvt.Cvt_Prj2LBH( gx,gy,gz,&lon,&lat,&hei );
-                getSunPos( gx,gy,gz,cx,cy,cz,lon*SPGC_R2D,lat*SPGC_R2D,yy,mm,dd,ho,mi,se,&sz,&vz,&as );                
-                if ( yy1==0 ){ sz1 = vz1 = as1 = 0; } 
-                else getSunPos( gx,gy,gz,cx1,cy1,cz1,lon*SPGC_R2D,lat*SPGC_R2D,yy1,mm1,dd1,ho1,mi1,se1,&sz1,&vz1,&as1 );
-#pragma omp critical
-                {
-                    local_olpF.Append(sz, vz, as, int(fc), int(rows - 1 - fr), cv,
-                        sz1, vz1, as1, int(fc1), int(rowsr - 1 - fr1), rv);
-                    tieSum++;
-                }
-                //olpF.Append( sz,vz,as,int(fc),int(rows-1-fr),cv,sz1,vz1,as1,int(fc1),int(rowsr-1-fr1),rv );
-				
-            }
+        // 先尝试使用现有 .olp
+        if (IsExist(strOlp) && olpF.Load4File(strOlp)) {
+            int oz = 0; olpF.GetData(&oz);
+            tieSum = oz;
+            usedExistingOlp = true;
+            cprintf("Use existing OLP: %s tieSum=%d\n", strOlp, tieSum);
         }
-		cprintf("tieSum= %d, skip (value<=0)=%d correlation=%d spectral=%d var=%d\n", tieSum, vSum, cSum, sSum, varSum);
-        //olpF.Save2File(strOlp);
-        local_olpF.Save2File(strOlp);
-        if ( bTxt ){ strcat(strOlp, ".txt"); olpF.Save2File(strOlp,0); }
+        else {
+            // 无 .olp，执行匹配生成
+            olpF.SetSize(0); rowsr = basImg.GetRows();
+
+#ifdef USE_OPENCV_MATCH
+            // 计算重叠掩膜（像素域）
+            cv::Mat maskDom, maskRef;
+            if (!BuildOverlapMasks(domImg, basImg, maskDom, maskRef, /*pad=*/128)) {
+                cprintf("No overlap, skip pair.\n");
+                continue;
+            }
+
+            // 像元尺度提示（>1 参考更粗，<1 参考更细）
+            double sHint = ComputeScaleHint(domImg, basImg);
+
+            // 多尺度 + 掩膜 匹配
+            ORBMatchResult fm = RunORBMatchMultiScale(domImg, basImg, sHint, &maskDom, &maskRef,
+                /*maxFeatures*/8000, /*scaleFactor*/1.2f,
+                /*nLevels*/8, /*ratio*/0.80f,
+                /*ransacThresh*/3.0, /*ransacConf*/0.999);
+            cprintf("ORB inliers = %zu\n", fm.ptsDom.size());
+
+            plotDom.reserve(fm.ptsDom.size()); plotRef.reserve(fm.ptsRef.size());
+
+            // 生成 .olp
+            for (size_t k = 0; k < fm.ptsDom.size(); ++k) {
+                float fc = fm.ptsDom[k].x;
+                float fr = fm.ptsDom[k].y;
+                float fc1 = fm.ptsRef[k].x;
+                float fr1 = fm.ptsRef[k].y;
+
+                if (fc < 0 || fr < 0 || fc >= cols || fr >= rows) continue;
+                if (fc1 < 0 || fr1 < 0 || fc1 >= basImg.GetCols() || fr1 >= rowsr) continue;
+
+                short cv[4] = { 0,0,0,0 }, rv[4] = { 0,0,0,0 };
+                const WORD* pD = (const WORD*)domImg.m_pImgDat + (INT64)int(fr) * cols * bnds + int(fc) * bnds;
+                const WORD* pR = (const WORD*)basImg.m_pImgDat + (INT64)int(fr1) * basImg.GetCols() * bnds + int(fc1) * bnds;
+                for (int b = 0; b < bnds && b < 4; b++) { cv[b] = (short)pD[b]; rv[b] = (short)pR[b]; }
+                if (cv[0] == 0 && cv[1] == 0 && cv[2] == 0) continue;
+                if (rv[0] == 0 && rv[1] == 0 && rv[2] == 0) continue;
+                if (rv[0] < 0 || rv[1] < 0 || rv[2] < 0 || rv[3] < 0 || cv[0] < 0 || cv[1] < 0 || cv[2] < 0 || cv[3] < 0) {
+                    continue;
+                }
+                gx = domImg.m_tlX + fc * domImg.m_dx;
+                gy = domImg.m_tlY - (rows - 1 - fr) * domImg.m_dy;
+                gz = grdZ;
+                geoCvt.Cvt_Prj2LBH(gx, gy, gz, &lon, &lat, &hei);
+                getSunPos(gx, gy, gz, cx, cy, cz, lon * SPGC_R2D, lat * SPGC_R2D, yy, mm, dd, ho, mi, se, &sz, &vz, &as);
+                if (yy1 == 0) { sz1 = vz1 = as1 = 0; }
+                else getSunPos(gx, gy, gz, cx1, cy1, cz1, lon * SPGC_R2D, lat * SPGC_R2D, yy1, mm1, dd1, ho1, mi1, se1, &sz1, &vz1, &as1);
+
+                olpF.Append(sz, vz, as,
+                    int(fc), int(rows - 1 - fr), cv,
+                    sz1, vz1, as1,
+                    int(fc1), int(rowsr - 1 - fr1), rv);
+                plotDom.emplace_back(fc, fr);
+                plotRef.emplace_back(fc1, fr1);
+                tieSum++;
+            }
+            cprintf("ORB tieSum=%d\n", tieSum);
+
+#else
+            for (r = 1; r < rows - gs; r += gs) {
+                for (c = 1; c < cols - gs; c += gs) {
+                    short* pC = (short*)(domImg.m_pImgDat + (r * cols + c) * pxSz);
+                    if (pC[0] == 0 && pC[1] == 0 && pC[2] == 0) continue;
+
+                    gx = domImg.m_tlX + c * domImg.m_dx;
+                    gy = domImg.m_tlY - (rows - 1 - r) * domImg.m_dy;
+                    gz = grdZ;
+                    if (!GetPxl(gx, gy, &domImg, cv, ws, &fc, &fr)) continue;
+                    if (cv[0] == 0 && cv[1] == 0 && cv[2] == 0) continue;
+                    if (!GetPxl(gx, gy, &basImg, rv, (yy1 == 0) ? 0 : ws, &fc1, &fr1)) continue;
+                    if (rv[0] == 0 && rv[1] == 0 && rv[2] == 0) continue;
+                    if (rv[0] < 0 || rv[1] < 0 || rv[2] < 0 || rv[3] < 0 || cv[0] < 0 || cv[1] < 0 || cv[2] < 0 || cv[3] < 0) {
+                        vSum++;
+                        continue;
+                    }
+                    double corr = CalculateRadiationCorrelation(cv, rv);
+                    if (corr < minCorr) {
+                        cSum++;
+                        continue;
+                    }
+                    geoCvt.Cvt_Prj2LBH(gx, gy, gz, &lon, &lat, &hei);
+                    getSunPos(gx, gy, gz, cx, cy, cz, lon * SPGC_R2D, lat * SPGC_R2D, yy, mm, dd, ho, mi, se, &sz, &vz, &as);
+                    if (yy1 == 0) { sz1 = vz1 = as1 = 0; }
+                    else getSunPos(gx, gy, gz, cx1, cy1, cz1, lon * SPGC_R2D, lat * SPGC_R2D, yy1, mm1, dd1, ho1, mi1, se1, &sz1, &vz1, &as1);
+                    tieSum++;
+                    olpF.Append(sz, vz, as, int(fc), int(rows - 1 - fr), cv, sz1, vz1, as1, int(fc1), int(rowsr - 1 - fr1), rv);
+
+                }
+            }
+            cprintf("tieSum= %d, skip (value<=0)=%d correlation=%d\n", tieSum, vSum, cSum);
+#endif
+        }
+        if (olpF.GetSize() > 0) {
+            // 保存 .olp（二进制）
+            olpF.Save2File(strOlp);
+            // 可选导出文本版
+            if (bTxt) {
+                char strTxt[512]; strcpy(strTxt, strOlp); strcat(strTxt, ".txt");
+                olpF.Save2File(strTxt, FALSE);
+            }
+#ifdef USE_OPENCV_MATCH
+            if (usedExistingOlp) {
+                SaveMatchesPlotFromOlp(domImg, basImg, olpF, strPlot);
+            }
+            else if (!plotDom.empty()) {
+                SaveMatchesPlotVec(domImg, basImg, plotDom, plotRef, strPlot);
+            }
+#endif
+        }
     }
     fclose(fTsk);
 
