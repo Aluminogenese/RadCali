@@ -26,13 +26,18 @@
 #include "OlpFile.hpp"
 
 #include <opencv2/opencv.hpp>
-//#include <opencv2/core.hpp>
-//#include <opencv2/imgproc.hpp>
 #include <opencv2/features2d.hpp>
-//#include <opencv2/calib3d.hpp>
 #pragma comment(lib,"opencv_imgproc490d.lib")
-//#define USE_EIGEN_BA 1
-#define USE_OPENCV_MATCH
+#define USE_MY_MATCH
+#ifndef RAD_PATCH_RADIUS
+#define RAD_PATCH_RADIUS   3    // 补丁半径 => 9x9 patch
+#endif
+#ifndef RAD_MIN_STD
+#define RAD_MIN_STD        1.0  // 最小标准差（灰度）
+#endif
+#ifndef RAD_MIN_ZNCC
+#define RAD_MIN_ZNCC       0.7 // 最小 ZNCC 阈值
+#endif
 
 #ifdef _DEBUG
 #define new DEBUG_NEW
@@ -558,11 +563,7 @@ void CRadCaliDlg::OnKeydownListCtrl(NMHDR* pNMHDR, LRESULT* pResult)
 DWORD WINAPI WuProcThread( LPVOID lpParam ) 
 {
 	CRadCaliDlg *pDlg = (CRadCaliDlg *)lpParam;
-#ifdef USE_EIGEN_BA
-    pDlg->ProcessWithEigen();
-#else
 	pDlg->Process();
-#endif
     ::ExitThread( 0 );  return TRUE;
 }
 
@@ -646,16 +647,6 @@ int comRI(const void *pA,const void *pB){
 
 void CRadCaliDlg::Process()
 {
-#ifndef ENABLE_OUTLIER_FILTER
-#define ENABLE_OUTLIER_FILTER 0          // 1 启用；0 关闭
-#endif
-#ifndef OUTLIER_SIGMA
-#define OUTLIER_SIGMA 3.0                // |l-mean| > 3σ 视为粗差
-#endif
-#ifndef MIN_OUTLIER_COUNT
-#define MIN_OUTLIER_COUNT 30             // 观测少于此数量不做剔除
-#endif
-
     gs_hWnd = m_hWnd;
 	m_hEThEHdl = ::CreateEvent( NULL,TRUE,FALSE,itostr( LONG(this) ) );
     
@@ -671,7 +662,7 @@ void CRadCaliDlg::Process()
     char *pS,strDir[256],strT[256],str[512];
     strcpy( strDir,m_strRet ); pS = strrchr( strDir,'\\' ); if (pS) *pS=0;
     
-    char strRom[256]; sprintf( strRom,"%s\\ROM_S2Borb",strDir );
+    char strRom[256]; sprintf( strRom,"%s\\ROM_S2Bexp",strDir );
     CreateDir( strRom );
 
     char strLog[256]; strcpy( strLog,m_strRet );
@@ -790,31 +781,42 @@ void CRadCaliDlg::Process()
 
     /////////////////////////////////
     COlpFile olpF; char strSrc[256],strRef[256],strOlp[512]; int idx,idxr;
-    if ( m_bAdj ){
-        print2Log( "RadBA start...\n" );
+    if (m_bAdj) {
+        print2Log("RadBA start...\n");
 
-        double *pAK1 = new double [sum*2]; 
-        double *pAK2 = pAK1+sum;
-        memset( pAK1,0,sizeof(double)*sum*2 );
-        for( i=0;i<sum;i++ ){
-            m_listCtrl.GetItemText(i,0,str,256); 
-            sprintf( strT,"%s%s.tsk_skm.txt",strRom,strrchr(str,'\\') );
-            FILE *fKM = fopen( strT,"rt");
-            fscanf( fKM,"%lf%lf", pAK1+i,pAK2+i );   print2Log("%lf %lf\n",pAK1[i],pAK2[i] );
+        double* pAK1 = new double[sum * 2];
+        double* pAK2 = pAK1 + sum;
+        memset(pAK1, 0, sizeof(double) * sum * 2);
+        for (i = 0; i < sum; i++) {
+            m_listCtrl.GetItemText(i, 0, str, 256);
+            sprintf(strT, "%s%s.tsk_skm.txt", strRom, strrchr(str, '\\'));
+            FILE* fKM = fopen(strT, "rt");
+            fscanf(fKM, "%lf%lf", pAK1 + i, pAK2 + i);   print2Log("%lf %lf\n", pAK1[i], pAK2[i]);
             fclose(fKM);
         }
 
-        double *aa = new double[ (sum*4)*(sum*4) ]; 
-        double *b = new double[ (sum*4) ]; 
-        double *a = new double[ (sum*4) ]; 
-        double *x = new double[ (sum*4) ];
-        
-        ProgBegin(sum*4);
-        for( c=0;c<4;c++ ){
-            UINT st=GetTickCount(); print2Log("proc band %d , Norml ... st= %d\n",c+1,st );
+        double* aa = new double[(sum * 4) * (sum * 4)];
+        double* b = new double[(sum * 4)];
+        double* a = new double[(sum * 4)];
+        double* x = new double[(sum * 4)];
+        double* xPrev = new double[(sum * 4)];
 
-            memset( aa,0,sizeof(double)*(sum*4)*(sum*4) );
-            memset( b,0,sizeof(double)*(sum*4) );
+        // 稳健IRLS参数
+        const int ROBUST_MAX_ITERS = 1;     // 稳健迭代最多轮次（轻量）
+        const double HUBER_C = 1.345;       // Huber常数（单位为sigma倍数）
+        auto huberW = [](double r, double k) -> double {
+            double ar = fabs(r);
+            if (k <= 1e-12) return 1.0;
+            return (ar <= k) ? 1.0 : (k / ar);
+            };
+
+        ProgBegin(sum * 4);
+        for (c = 0; c < 4; c++) {
+            UINT st = GetTickCount(); print2Log("proc band %d , Norml ... st= %d\n", c + 1, st);
+
+            // 初始法方程（保持原基线权）
+            memset(aa, 0, sizeof(double) * (sum * 4) * (sum * 4));
+            memset(b, 0, sizeof(double) * (sum * 4));
             for (i = 0; i < sum; i++, ProgStep(cancel)) {
                 if (::WaitForSingleObject(m_hEThEHdl, 1) == WAIT_OBJECT_0) break;
 
@@ -833,133 +835,208 @@ void CRadCaliDlg::Process()
                     if (olpF.Load4File(strOlp)) {
                         double k1, k2, k1r, k2r, l;
                         int v, oz; OBV* pOs = olpF.GetData(&oz); cprintf("%s tieSum= %d\n", strOlp, oz);
-#if ENABLE_OUTLIER_FILTER
-                        double sumL = 0.0, sumL2 = 0.0; int cntL = 0;
-                        {
-                            OBV* pAll = pOs;
-                            if (idxr == -1) {
-                                for (int vv = 0; vv < oz; ++vv) {
-                                    double lRaw = pAll[vv].rv[c];
-                                    if (lRaw != 0) { sumL += lRaw; sumL2 += lRaw * lRaw; cntL++; }
-                                }
-                            }
-                            else {
-                                for (int vv = 0; vv < oz; ++vv) {
-                                    double lRaw = pAll[vv].cv[c] - pAll[vv].rv[c];
-                                    sumL += lRaw; sumL2 += lRaw * lRaw; cntL++;
-                                }
-                            }
-                        }
-                        double meanL = 0, stdL = 0;
-                        bool doFilter = false;
-                        if (cntL >= MIN_OUTLIER_COUNT) {
-                            meanL = sumL / cntL;
-                            double varL = (sumL2 - sumL * sumL / cntL) / ((cntL > 1) ? (cntL - 1) : 1);
-                            if (varL > 0) stdL = sqrt(varL);
-                            if (stdL > 1e-9) doFilter = true;
-                        }
-                        int outlierCnt = 0, inlierCnt = 0;
-#endif
                         if (idxr == -1) {
-                            pOs = olpF.GetData(&oz);
                             for (v = 0; v < oz; v++, pOs++) {
-                                k1 = getKval(1, pOs->csz, pOs->cvz, pOs->cas);
-                                k2 = getKval(4, pOs->csz, pOs->cvz, pOs->cas);
-                                k1 -= pAK1[idx]; k2 -= pAK2[idx];
-
+                                k1 = getKval(1, pOs->csz, pOs->cvz, pOs->cas) - pAK1[idx];
+                                k2 = getKval(4, pOs->csz, pOs->cvz, pOs->cas) - pAK2[idx];
                                 memset(a, 0, sizeof(double) * (sum * 4));
-                                l = (pOs->rv[c]); // gb
-#if ENABLE_OUTLIER_FILTER
-                                if (doFilter) {
-                                    double lDev = l - meanL;
-                                    if (fabs(lDev) > OUTLIER_SIGMA * stdL) {
-                                        outlierCnt++;
-                                        continue; // 剔除
-                                    }
-                                }
-                                inlierCnt++;
-#endif
+                                l = (pOs->rv[c]);
                                 a[idx * 4 + 0] = -1;
                                 a[idx * 4 + 1] = -k1;
                                 a[idx * 4 + 2] = -k2;
-                                a[idx * 4 + 3] = pOs->cv[c]; // g1
-                                Nrml(a, (sum * 4), l, aa, b, 1);
+                                a[idx * 4 + 3] = pOs->cv[c];
+                                Nrml(a, (sum * 4), l, aa, b, 1.0);
                             }
                         }
                         else {
-                            pOs = olpF.GetData(&oz);
                             for (v = 0; v < oz; v++, pOs++) {
-                                k1 = getKval(1, pOs->csz, pOs->cvz, pOs->cas);
-                                k2 = getKval(4, pOs->csz, pOs->cvz, pOs->cas);
-                                k1 -= pAK1[idx]; k2 -= pAK2[idx];
-
-                                k1r = getKval(1, pOs->rsz, pOs->rvz, pOs->ras);
-                                k2r = getKval(4, pOs->rsz, pOs->rvz, pOs->ras);
-                                k1r -= pAK1[idxr]; k2r -= pAK2[idxr];
-
+                                k1 = getKval(1, pOs->csz, pOs->cvz, pOs->cas) - pAK1[idx];
+                                k2 = getKval(4, pOs->csz, pOs->cvz, pOs->cas) - pAK2[idx];
+                                k1r = getKval(1, pOs->rsz, pOs->rvz, pOs->ras) - pAK1[idxr];
+                                k2r = getKval(4, pOs->rsz, pOs->rvz, pOs->ras) - pAK2[idxr];
                                 memset(a, 0, sizeof(double) * (sum * 4));
-                                l = pOs->cv[c] - pOs->rv[c]; // g1-g2
-#if ENABLE_OUTLIER_FILTER
-                                if (doFilter) {
-                                    double lDev = l - meanL;
-                                    if (fabs(lDev) > OUTLIER_SIGMA * stdL) {
-                                        outlierCnt++;
-                                        continue;
-                                    }
-                                }
-                                inlierCnt++;
-#endif
-                                a[idx * 4 + 0] = 1;
-                                a[idx * 4 + 1] = k1;
-                                a[idx * 4 + 2] = k2;
-                                a[idx * 4 + 3] = 0;
-                                a[idxr * 4 + 0] = -1;
-                                a[idxr * 4 + 1] = -k1r;
-                                a[idxr * 4 + 2] = -k2r;
-                                a[idxr * 4 + 3] = 0;
+                                l = pOs->cv[c] - pOs->rv[c];
+                                a[idx * 4 + 0] = 1;  a[idx * 4 + 1] = k1;  a[idx * 4 + 2] = k2;
+                                a[idxr * 4 + 0] = -1; a[idxr * 4 + 1] = -k1r; a[idxr * 4 + 2] = -k2r;
                                 Nrml(a, (sum * 4), l, aa, b, 0.1);
                             }
                         }
-#if ENABLE_OUTLIER_FILTER
-                        if (cntL >= MIN_OUTLIER_COUNT) {
-                            print2Log("  olp=%s total=%d inlier=%d outlier=%d mean=%.3lf std=%.3lf sigma=%.1f\n",
-                                strrchr(strOlp, '\\') ? strrchr(strOlp, '\\') + 1 : strOlp,
-                                cntL, inlierCnt, outlierCnt, meanL, stdL, OUTLIER_SIGMA);
-                        }
-                        else {
-                            print2Log("  olp=%s total=%d (skip outlier filter: cnt<%d)\n",
-                                strrchr(strOlp, '\\') ? strrchr(strOlp, '\\') + 1 : strOlp,
-                                cntL, MIN_OUTLIER_COUNT);
-                        }
-#endif
                     }
                 }
                 fclose(fTsk);
                 print2Log(", used tm= %.2lf sec \n", (GetTickCount() - ss) * 0.001);
             }
-            print2Log("Norml ...over. tm= %.2lf sec \nSolve ... st= %d \n",(GetTickCount()-st)*0.001,GetTickCount() ); 
+            print2Log("Norml ...over. tm= %.2lf sec \nSolve ... st= %d \n", (GetTickCount() - st) * 0.001, GetTickCount());
 
-            memset( x,0,sizeof(double)*(sum*4) );  st = GetTickCount();
-            Solve( aa,b,x,(sum*4),(sum*4) );
+            // 初解
+            memset(x, 0, sizeof(double) * (sum * 4));
+            Solve(aa, b, x, (sum * 4), (sum * 4));
+            memcpy(xPrev, x, sizeof(double) * (sum * 4));
+            double sigmaForK_prev = 0.0;
+            // 稳健IRLS
+            for (int it = 0; it < ROBUST_MAX_ITERS; ++it) {
+                UINT stRes = GetTickCount();
+                // 1) 计算残差RMS（近似sigma）
+                double sumr2 = 0.0; INT64 nobs = 0;
 
-            print2Log( "Solve .. over. tm = %.2lf \n",(GetTickCount()-st)*0.001 );
+                for (i = 0; i < sum; i++) {
+                    m_listCtrl.GetItemText(i, 0, str, 256);
+                    sprintf(strT, "%s%s.tsk", strRom, strrchr(str, '\\'));
+                    FILE* fTsk = fopen(strT, "rt"); if (!fTsk) continue;
+                    fgets(str, 512, fTsk); sscanf(str, "%s", strSrc); DOS_PATH(strSrc);
+                    fgets(str, 512, fTsk); sscanf(str, "%d", &idx);
 
-                    sprintf(str, "%s//pre_bnd%d.txt", strRom, c + 1);
-            FILE *fKnl = fopen( str,"wt" );
-            for( i=0;i<sum;i++ ){
-                m_listCtrl.GetItemText(i,0,str,256);
-                fprintf( fKnl,"%9.6lf \t %15.6lf \t %15.6lf \t %15.6lf \t %s\n",x[i*4+3],x[i*4+0],x[i*4+1],x[i*4+2],strrchr(str,'\\') );
+                    while (!feof(fTsk)) {
+                        if (!fgets(str, 512, fTsk)) break;
+                        sscanf(str, "%s", strRef); DOS_PATH(strRef);
+                        if (!fgets(str, 512, fTsk)) break;
+                        sscanf(str, "%d", &idxr);
+                        strcpy(strOlp, strT);  strcpy(strrchr(strOlp, '.'), "_"); strcat(strOlp, strrchr(strRef, '\\') + 1); strcat(strOlp, ".olp");
+                        if (!olpF.Load4File(strOlp)) continue;
+
+                        int oz = 0; OBV* pOs = olpF.GetData(&oz);
+                        for (int v = 0; v < oz; ++v, ++pOs) {
+                            double k1, k2, k1r = 0, k2r = 0, l;
+                            if (idxr == -1) {
+                                k1 = getKval(1, pOs->csz, pOs->cvz, pOs->cas) - pAK1[idx];
+                                k2 = getKval(4, pOs->csz, pOs->cvz, pOs->cas) - pAK2[idx];
+                                l = pOs->rv[c];
+                                // dot = a*x
+                                double dot = (-1.0) * x[idx * 4 + 0]
+                                    + (-k1) * x[idx * 4 + 1]
+                                    + (-k2) * x[idx * 4 + 2]
+                                    + (double)pOs->cv[c] * x[idx * 4 + 3];
+                                double r = l - dot;
+                                sumr2 += r * r; nobs++;
+                            }
+                            else {
+                                k1 = getKval(1, pOs->csz, pOs->cvz, pOs->cas) - pAK1[idx];
+                                k2 = getKval(4, pOs->csz, pOs->cvz, pOs->cas) - pAK2[idx];
+                                k1r = getKval(1, pOs->rsz, pOs->rvz, pOs->ras) - pAK1[idxr];
+                                k2r = getKval(4, pOs->rsz, pOs->rvz, pOs->ras) - pAK2[idxr];
+                                l = pOs->cv[c] - pOs->rv[c];
+                                double dot =
+                                    (1.0) * x[idx * 4 + 0] + (k1)*x[idx * 4 + 1] + (k2)*x[idx * 4 + 2]
+                                    + (-1.0) * x[idxr * 4 + 0] + (-k1r) * x[idxr * 4 + 1] + (-k2r) * x[idxr * 4 + 2];
+                                double r = l - dot;
+                                sumr2 += r * r; nobs++;
+                            }
+                        }
                     }
-                    fclose(fKnl);
+                    fclose(fTsk);
                 }
-        delete []pAK1;
-        delete []aa; 
-        delete []a;
-        delete []b;
-        delete []x;
-        
-        ProgEnd();   
-        print2Log( "RadBA over.\n" );
+                double dof = (double)std::max<INT64>(1, nobs - (INT64)sum * 4);
+                double sigmaRaw = std::sqrt(sumr2 / dof);
+
+                // 用于门限的尺度：单调不升，避免阈值变宽
+                double sigmaForK = (it == 0) ? sigmaRaw : std::min(sigmaForK_prev, sigmaRaw);
+                sigmaForK_prev = sigmaForK;
+                double kThr = HUBER_C * sigmaForK;
+                print2Log("band %d iter %d: nobs=%lld sigmaRaw=%.6f sigmaForK=%.6f (tm=%.2fs)\n",
+                    c + 1, it + 1, (long long)nobs, sigmaRaw, sigmaForK, (GetTickCount() - stRes) * 0.001);
+
+                // 2) 以Huber权重重建法方程
+                memset(aa, 0, sizeof(double) * (sum * 4) * (sum * 4));
+                memset(b, 0, sizeof(double) * (sum * 4));
+                double sumr2W = 0.0, sumW = 0.0;
+                for (i = 0; i < sum; i++) {
+                    m_listCtrl.GetItemText(i, 0, str, 256);
+                    sprintf(strT, "%s%s.tsk", strRom, strrchr(str, '\\'));
+                    FILE* fTsk = fopen(strT, "rt"); if (!fTsk) continue;
+                    fgets(str, 512, fTsk); sscanf(str, "%s", strSrc); DOS_PATH(strSrc);
+                    fgets(str, 512, fTsk); sscanf(str, "%d", &idx);
+
+                    while (!feof(fTsk)) {
+                        if (!fgets(str, 512, fTsk)) break;
+                        sscanf(str, "%s", strRef); DOS_PATH(strRef);
+                        if (!fgets(str, 512, fTsk)) break;
+                        sscanf(str, "%d", &idxr);
+                        strcpy(strOlp, strT);  strcpy(strrchr(strOlp, '.'), "_"); strcat(strOlp, strrchr(strRef, '\\') + 1); strcat(strOlp, ".olp");
+                        if (!olpF.Load4File(strOlp)) continue;
+
+                        int oz = 0; OBV* pOs = olpF.GetData(&oz);
+                        if (idxr == -1) {
+                            for (int v = 0; v < oz; ++v, ++pOs) {
+                                double k1 = getKval(1, pOs->csz, pOs->cvz, pOs->cas) - pAK1[idx];
+                                double k2 = getKval(4, pOs->csz, pOs->cvz, pOs->cas) - pAK2[idx];
+                                double l = (pOs->rv[c]);
+                                double dot = (-1.0) * x[idx * 4 + 0]
+                                    + (-k1) * x[idx * 4 + 1]
+                                    + (-k2) * x[idx * 4 + 2]
+                                    + (double)pOs->cv[c] * x[idx * 4 + 3];
+                                double r = l - dot;
+                                double w = 1.0 * huberW(r, kThr); // 基线权(1.0) * 残差权
+
+                                memset(a, 0, sizeof(double) * (sum * 4));
+                                a[idx * 4 + 0] = -1;
+                                a[idx * 4 + 1] = -k1;
+                                a[idx * 4 + 2] = -k2;
+                                a[idx * 4 + 3] = pOs->cv[c];
+                                Nrml(a, (sum * 4), l, aa, b, w);
+
+                                sumr2W += w * r * r; sumW += w;
+                            }
+                        }
+                        else {
+                            for (int v = 0; v < oz; ++v, ++pOs) {
+                                double k1 = getKval(1, pOs->csz, pOs->cvz, pOs->cas) - pAK1[idx];
+                                double k2 = getKval(4, pOs->csz, pOs->cvz, pOs->cas) - pAK2[idx];
+                                double k1r = getKval(1, pOs->rsz, pOs->rvz, pOs->ras) - pAK1[idxr];
+                                double k2r = getKval(4, pOs->rsz, pOs->rvz, pOs->ras) - pAK2[idxr];
+                                double l = pOs->cv[c] - pOs->rv[c];
+                                double dot =
+                                    (1.0) * x[idx * 4 + 0] + (k1)*x[idx * 4 + 1] + (k2)*x[idx * 4 + 2]
+                                    + (-1.0) * x[idxr * 4 + 0] + (-k1r) * x[idxr * 4 + 1] + (-k2r) * x[idxr * 4 + 2];
+                                double r = l - dot;
+                                double w = 0.1 * huberW(r, kThr); // 基线权(0.05) * 残差权
+
+                                memset(a, 0, sizeof(double) * (sum * 4));
+                                a[idx * 4 + 0] = 1;  a[idx * 4 + 1] = k1;  a[idx * 4 + 2] = k2;
+                                a[idxr * 4 + 0] = -1; a[idxr * 4 + 1] = -k1r; a[idxr * 4 + 2] = -k2r;
+                                Nrml(a, (sum * 4), l, aa, b, w);
+
+                                sumr2W += w * r * r; sumW += w;
+                            }
+                        }
+                    }
+                    fclose(fTsk);
+                }
+
+                // 3) 重新求解并检查收敛
+                Solve(aa, b, x, (sum * 4), (sum * 4));
+                double dofW = std::max(1.0, sumW - (double)sum * 4);
+                double sigmaW = std::sqrt(std::max(0.0, sumr2W / dofW));
+                print2Log("band %d iter %d solved. sigmaW=%.6f (weighted), sumW=%.3f, dofW=%.0f\n",
+                    c + 1, it + 1, sigmaW, sumW, dofW);
+
+                double maxDiff = 0.0;
+                for (int q = 0; q < sum * 4; ++q) {
+                    maxDiff = std::max(maxDiff, std::fabs(x[q] - xPrev[q]));
+                }
+                print2Log("band %d iter %d solved. max |dx| = %.3e\n", c + 1, it + 1, maxDiff);
+                memcpy(xPrev, x, sizeof(double) * (sum * 4));
+                if (maxDiff < 1e-6) { print2Log("band %d converged at iter %d\n", c + 1, it + 1); break; }
+            } // end IRLS
+
+            // 输出最终解
+            sprintf(str, "%s//pre_bnd%d.txt", strRom, c + 1);
+            FILE* fKnl = fopen(str, "wt");
+            for (i = 0; i < sum; i++) {
+                m_listCtrl.GetItemText(i, 0, str, 256);
+                fprintf(fKnl, "%9.6lf \t %15.6lf \t %15.6lf \t %15.6lf \t %s\n",
+                    x[i * 4 + 3], x[i * 4 + 0], x[i * 4 + 1], x[i * 4 + 2], strrchr(str, '\\'));
+            }
+            fclose(fKnl);
+        }
+        delete[]pAK1;
+        delete[]aa;
+        delete[]a;
+        delete[]b;
+        delete[]x;
+        delete[]xPrev;
+
+        ProgEnd();
+        print2Log("RadBA over.\n");
     }
 
    	if (m_hW4EndHdl) ::SetEvent( m_hW4EndHdl );
@@ -967,323 +1044,6 @@ void CRadCaliDlg::Process()
 	::CloseHandle( m_hThread ); m_hThread = NULL;
     
     PostMessage( WM_OUTPUT_MSG,THREADEND,0 );
-}
-
-void CRadCaliDlg::ProcessWithEigen()
-{
-    gs_hWnd = m_hWnd;
-    m_hEThEHdl = ::CreateEvent(NULL, TRUE, FALSE, itostr(LONG(this)));
-
-    CTime stTm; SYSTEM_INFO sysInfo; GetSystemInfo(&sysInfo);
-    if (sysInfo.dwNumberOfProcessors > MAX_CPU) sysInfo.dwNumberOfProcessors = MAX_CPU;
-    BOOL bRun = FALSE; int maxTm = 120, cpuSum = atoi(m_strMxCore);
-    if (cpuSum < 1) cpuSum = 1;  if (cpuSum > sysInfo.dwNumberOfProcessors - 1) cpuSum = sysInfo.dwNumberOfProcessors - 1;
-    char strCmd[1024], strExe[256]; ::GetModuleFileName(NULL, strExe, sizeof(strExe));
-
-    m_strMxCore.Format("%d", cpuSum);
-    AfxGetApp()->WriteProfileString("CRadCaliDlg", "CPUs", m_strMxCore);
-
-    char* pS, strDir[256], strT[256], str[512];
-    strcpy(strDir, m_strRet); pS = strrchr(strDir, '\\'); if (pS) *pS = 0;
-
-    char strRom[256]; sprintf(strRom, "%s\\ROM_S2Bexp", strDir);
-    CreateDir(strRom);
-
-    char strLog[256]; strcpy(strLog, m_strRet);
-    sprintf(str, "%s-s2b-eigen.log", strLog);
-    ::DeleteFile(str);  openLog(str);
-
-    int i, j, c, b, sum = m_listCtrl.GetItemCount();
-
-    struct RI {
-        int idx;
-        float area;
-    }; RI iRi, * pRi = new RI[sum + 8];
-    struct RGN {
-        double x[8];
-        double y[8];
-        int sz;
-    }; RGN iRg, * pRg = new RGN[sum + 8];
-    memset(pRg, 0, sizeof(RGN) * sum);
-    IMGPAR imgPar; CTMGeom cc;
-    double xs, ys, zs, phi, omg, kap, grdZ;
-    sprintf(strT, "%s\\imgPar.dpi", strDir); DOS_PATH(strT);
-    CTMVziFile vziFile; vziFile.Load4File(strT);
-    for (i = 0; i < sum; i++) {
-        m_listCtrl.GetItemText(i, 1, str, 256);
-        imgPar = vziFile.m_imgPar;
-        sscanf(str, "%lf%lf%lf%lf%lf%lf%lf", &xs, &ys, &zs, &phi, &omg, &kap, &grdZ);
-        imgPar.aopX = xs; imgPar.aopY = ys; imgPar.aopZ = zs;
-        imgPar.aopP = phi; imgPar.aopO = omg; imgPar.aopK = kap;
-        cc.Init(&imgPar); pRg[i].sz = 4;
-        cc.GetGrdPrjRgn(imgPar.iopX * 2, imgPar.iopY * 2, grdZ, pRg[i].x, pRg[i].y);
-    }
-
-    if (m_bTie) print2Log("MchTie start...\n");
-
-    ProgBegin(sum); int cancel;
-    for (i = 0; i < sum; i++, ProgStep(cancel)) {
-        if (::WaitForSingleObject(m_hEThEHdl, 1) == WAIT_OBJECT_0) break;
-
-        m_listCtrl.GetItemText(i, 0, str, 256);  print2Log("process: %s\n", strrchr(str, '\\'));
-        sprintf(strT, "%s%s.tsk", strRom, strrchr(str, '\\'));
-        FILE* fTsk = fopen(strT, "wt");
-        fprintf(fTsk, "%s\n%d %s %d %d %d\n", str, i, m_listCtrl.GetItemText(i, 1), m_gs, m_ws, m_bTxt);
-        fprintf(fTsk, "%s\n%s\n", m_strBas, "-1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 ");
-
-        iRi.area = (float)(GetRgnArea(pRg[i].x, pRg[i].y, pRg[i].sz));
-        memset(pRi, 0, sizeof(RI) * sum);
-        for (j = 0; j < sum; j++) {
-            if (j == i) continue;
-            iRg.sz = 0;
-            RgnClip(pRg[i].x, pRg[i].y, pRg[i].sz,
-                pRg[j].x, pRg[j].y, pRg[j].sz,
-                iRg.x, iRg.y, &iRg.sz);
-            if (iRg.sz > 2) {
-                pRi[j].idx = j;
-                pRi[j].area = (float)(GetRgnArea(iRg.x, iRg.y, iRg.sz));
-            }
-        }
-        qsort(pRi, sum, sizeof(RI), &comRI);
-        for (j = 0; j < sum; j++) {
-            if (pRi[j].area / iRi.area < 0.01) break;
-            fprintf(fTsk, "%s\n", m_listCtrl.GetItemText(pRi[j].idx, 0));
-            fprintf(fTsk, "%d %s\n", pRi[j].idx, m_listCtrl.GetItemText(pRi[j].idx, 1));
-        }
-        fclose(fTsk);
-
-        if (m_bTie) {
-#ifdef _DEBUG
-            sprintf(strCmd, "TIE@%s", strT);
-            MchTie(strCmd);
-#else
-            sprintf(strCmd, "%s TIE@%s", strExe, strT);
-            print2Log("%s\n", strCmd);
-#endif
-
-            bRun = FALSE;
-            while (!bRun) {
-                for (int c = 0; c < cpuSum; c++) {
-                    if (gs_hThreadId[c] == NULL) {
-                        strcpy(gs_strCmd[c], strCmd);
-                        HANDLE hThread = ::CreateThread(NULL, 0, CupThread_CRadCaliDlg, (void*)gs_strCmd[c], 0, gs_hThreadId + c);
-                        ::CloseHandle(hThread); bRun = TRUE; break;
-                    }
-                    if (::WaitForSingleObject(m_hEThEHdl, 16) == WAIT_OBJECT_0) break;
-                }
-            }
-        }
-    }
-    delete[]pRi;
-    delete[]pRg;
-
-    stTm = CTime::GetCurrentTime();
-    while (1) {
-        for (c = 0; c < MAX_CPU; c++) { if (gs_hThreadId[c] != NULL) break; }
-        if (c == MAX_CPU || ::WaitForSingleObject(m_hEThEHdl, 128) == WAIT_OBJECT_0) break;
-        CTimeSpan ts = CTime::GetCurrentTime() - stTm;
-        if (ts.GetTotalMinutes() > maxTm) {
-            for (int i = 0; i < MAX_CPU; i++) {
-                if (gs_hProcId[i]) {
-                    HANDLE hProc = ::OpenProcess(PROCESS_TERMINATE, FALSE, gs_hProcId[i]);
-                    if (hProc) ::TerminateProcess(hProc, 0x22);
-                    gs_hProcId[i] = 0; Sleep(8);
-                }
-            }
-            break;
-        }
-    }
-    if (m_bTie) print2Log("MchTie over.\n");
-    ProgEnd();
-
-    COlpFile olpF; char strSrc[256], strRef[256], strOlp[512]; int idx, idxr;
-    if (m_bAdj) {
-        print2Log("RadBA with Eigen start...\n");
-
-        double* pAK1 = new double[sum * 2];
-        double* pAK2 = pAK1 + sum;
-        memset(pAK1, 0, sizeof(double)* sum * 2);
-        for (i = 0; i < sum; i++) {
-            m_listCtrl.GetItemText(i, 0, str, 256);
-            sprintf(strT, "%s%s.tsk_skm.txt", strRom, strrchr(str, '\\'));
-            FILE* fKM = fopen(strT, "rt");
-            fscanf(fKM, "%lf%lf", pAK1 + i, pAK2 + i);   print2Log("%lf %lf\n", pAK1[i], pAK2[i]);
-            fclose(fKM);
-        }
-
-        ProgBegin(sum * 4);
-        for (c = 0; c < 4; c++) {
-            UINT st = GetTickCount();
-            print2Log("proc band %d with Eigen, st= %d\n", c + 1, st);
-
-            Eigen::SparseMatrix<double> AtA(sum * 4, sum * 4);
-            Eigen::VectorXd Atb = Eigen::VectorXd::Zero(sum * 4);
-
-            for (i = 0; i < sum; i++, ProgStep(cancel)) {
-                if (::WaitForSingleObject(m_hEThEHdl, 1) == WAIT_OBJECT_0) break;
-
-                m_listCtrl.GetItemText(i, 0, str, 256); print2Log("process[%d @ %d]: %s ", i + 1, sum, strrchr(str, '\\')); UINT ss = GetTickCount();
-                sprintf(strT, "%s%s.tsk", strRom, strrchr(str, '\\'));
-
-                FILE* fTsk = fopen(strT, "rt");
-                if (!fTsk) continue;
-
-                fgets(str, 512, fTsk); sscanf(str, "%s", strSrc); DOS_PATH(strSrc);
-                fgets(str, 512, fTsk); sscanf(str, "%d", &idx);
-
-                std::vector<Eigen::Triplet<double>> triplets;
-
-                while (!feof(fTsk)) {
-                    if (!fgets(str, 512, fTsk)) break;
-                    sscanf(str, "%s", strRef); DOS_PATH(strRef);
-                    if (!fgets(str, 512, fTsk)) break;
-                    sscanf(str, "%d", &idxr);
-                    strcpy(strOlp, strT);  strcpy(strrchr(strOlp, '.'), "_");
-                    strcat(strOlp, strrchr(strRef, '\\') + 1); strcat(strOlp, ".olp");
-
-                    if (olpF.Load4File(strOlp)) {
-                        double k1, k2, k1r, k2r, l;
-                        int v, oz; OBV* pOs = olpF.GetData(&oz); cprintf("%s tieSum= %d\n", strOlp, oz);
-
-                        if (idxr == -1) {
-                            for(v=0;v<oz;v++,pOs++){
-                                k1 = getKval(1, pOs->csz, pOs->cvz, pOs->cas);
-                                k2 = getKval(4, pOs->csz, pOs->cvz, pOs->cas);
-                                k1 -= pAK1[idx]; k2 -= pAK2[idx];
-								l = pOs->rv[c];// gb
-                                std::vector<std::pair<int, double>> a_nonzeros;
-                                a_nonzeros.push_back({ idx * 4 + 0, -1 });
-                                a_nonzeros.push_back({ idx * 4 + 1, -k1 });
-                                a_nonzeros.push_back({ idx * 4 + 2, -k2 });
-                                a_nonzeros.push_back({ idx * 4 + 3, pOs->cv[c] });
-
-                                for (const auto& ai : a_nonzeros) {
-                                    for (const auto& aj : a_nonzeros) {
-                                        triplets.push_back(Eigen::Triplet<double>(ai.first, aj.first, ai.second * aj.second));
-                                    }
-                                    Atb[ai.first] += ai.second * l;
-                                }
-                            }
-                        }
-                        else {
-                            for (v = 0; v < oz; v++, pOs++) {
-                                k1 = getKval(1, pOs->csz, pOs->cvz, pOs->cas);
-                                k2 = getKval(4, pOs->csz, pOs->cvz, pOs->cas);
-                                k1 -= pAK1[idx]; k2 -= pAK2[idx];
-                                k1r = getKval(1, pOs->rsz, pOs->rvz, pOs->ras);
-                                k2r = getKval(4, pOs->rsz, pOs->rvz, pOs->ras);
-                                k1r -= pAK1[idxr]; k2r -= pAK2[idxr];
-                                l = pOs->cv[c] - pOs->rv[c];
-                                std::vector<std::pair<int, double>> a_nonzeros;
-                                a_nonzeros.push_back({ idx * 4 + 0, 1 });
-                                a_nonzeros.push_back({ idx * 4 + 1, k1 });
-                                a_nonzeros.push_back({ idx * 4 + 2, k2 });
-                                a_nonzeros.push_back({ idxr * 4 + 0, -1 });
-                                a_nonzeros.push_back({ idxr * 4 + 1, -k1r });
-                                a_nonzeros.push_back({ idxr * 4 + 2, -k2r });
-
-                                for (const auto& ai : a_nonzeros) {
-                                    for (const auto& aj : a_nonzeros) {
-                                        triplets.push_back(Eigen::Triplet<double>(ai.first, aj.first, ai.second * aj.second));
-                                    }
-                                    Atb[ai.first] += ai.second * l;
-                                }
-                            }
-                        }
-
-                    }
-                }
-                fclose(fTsk);
-                Eigen::SparseMatrix<double> temp_AtA(sum * 4, sum * 4);
-                temp_AtA.setFromTriplets(triplets.begin(), triplets.end());
-
-                AtA += temp_AtA;
-                print2Log(", used tm= %.2lf sec\n", (GetTickCount() - ss) * 0.001);
-            }
-            print2Log("Norml ...over. tm= %.2lf sec \nSolve ... st= %d \n", (GetTickCount() - st) * 0.001, GetTickCount());
-
-            st = GetTickCount();
-            print2Log("Solving with iterative solver...\n");
-
-            Eigen::VectorXd x = Eigen::VectorXd::Zero(sum * 4);
-
-            bool solved = false;
-
-            // 共轭梯度法
-            if (!solved) {
-                Eigen::ConjugateGradient<Eigen::SparseMatrix<double>, Eigen::Lower | Eigen::Upper> cg;
-                cg.setMaxIterations(MAX_SOLVER_ITERATIONS);
-                cg.setTolerance(SOLVER_TOLERANCE);
-                cg.compute(AtA);
-
-                if (cg.info() == Eigen::Success) {
-                    x = cg.solve(Atb);
-                    if (cg.info() == Eigen::Success) {
-                        print2Log("ConjugateGradient solve success. Iterations: %ld, Error: %.2e, tm: %.2lf sec\n",
-                            cg.iterations(), cg.error(), (GetTickCount() - st) * 0.001);
-                        solved = true;
-                    }
-                }
-            }
-
-            //双共轭梯度稳定法（适合非对称系统）
-            if (!solved) {
-                Eigen::BiCGSTAB<Eigen::SparseMatrix<double>> bicgstab;
-                bicgstab.setMaxIterations(MAX_SOLVER_ITERATIONS);
-                bicgstab.setTolerance(SOLVER_TOLERANCE);
-                bicgstab.compute(AtA);
-
-                if (bicgstab.info() == Eigen::Success) {
-                    x = bicgstab.solve(Atb);
-                    if (bicgstab.info() == Eigen::Success) {
-                        print2Log("BiCGSTAB solve success. Iterations: %ld, Error: %.2e, tm: %.2lf sec\n",
-                            bicgstab.iterations(), bicgstab.error(), (GetTickCount() - st) * 0.001);
-                        solved = true;
-                    }
-                }
-            }
-
-            //稀疏LU分解（内存消耗较大但最稳定）
-            if (!solved) {
-                print2Log("Iterative solvers failed, using Sparse LU...\n");
-                Eigen::SparseLU<Eigen::SparseMatrix<double>> sparseLU;
-                sparseLU.compute(AtA);
-
-                if (sparseLU.info() == Eigen::Success) {
-                    x = sparseLU.solve(Atb);
-                    if (sparseLU.info() == Eigen::Success) {
-                        print2Log("SparseLU solve success. tm: %.2lf sec\n", (GetTickCount() - st) * 0.001);
-                        solved = true;
-                    }
-                }
-            }
-
-            if (!solved) {
-                print2Log("All solvers failed for band %d!\n", c + 1);
-                continue;
-            }
-
-            sprintf(str, "%s//pre_bnd%d_eigen.txt", strRom, c + 1);
-            FILE* fKnl = fopen(str, "wt");
-            if (fKnl) {
-                for (i = 0; i < sum; i++) {
-                    m_listCtrl.GetItemText(i, 0, str, 256);
-                    fprintf(fKnl, "%9.6lf \t %15.6lf \t %15.6lf \t %15.6lf \t %s\n",
-                        x[i * 4 + 3], x[i * 4 + 0], x[i * 4 + 1], x[i * 4 + 2],
-                        strrchr(str, '\\'));
-                }
-                fclose(fKnl);
-            }
-        }
-        ProgEnd();
-        print2Log("RadBA with Eigen completed.\n");
-    }
-
-    if (m_hW4EndHdl) ::SetEvent(m_hW4EndHdl);
-    if (m_hEThEHdl) ::CloseHandle(m_hEThEHdl); m_hEThEHdl = NULL;
-    ::CloseHandle(m_hThread); m_hThread = NULL;
-
-    PostMessage(WM_OUTPUT_MSG, THREADEND, 0);
 }
 
 void CRadCaliDlg::OnTaskOver( UINT tskId )
@@ -1381,109 +1141,100 @@ static bool GetPxl(double gx,double gy,CWuErsImage *pImg,short *pv,int gs,double
     return true;
 }
 
-// 辐射相关性计算函数
-static inline double CalculateRadiationCorrelation(short cv[4], short rv[4]) {
-    double sum1 = 0, sum2 = 0, sum11 = 0, sum22 = 0, sum12 = 0;
-    int valid_bands = 0;
+// 从16位多光谱取灰度（前3波段均值）
+static inline double GrayFromWordBands(const WORD* px) {
+    int valid = 0; int sum = 0;
+    for (int b = 0; b < 3; ++b) { if (px[b] > 0) { sum += (int)px[b]; valid++; } }
+    return valid ? double(sum) / valid : 0.0;
+}
 
-    for (int b = 0; b < 4; b++) {
-        if (cv[b] > 0 && rv[b] > 0) { // 只处理有效波段
-            sum1 += cv[b];
-            sum2 += rv[b];
-            sum11 += cv[b] * cv[b];
-            sum22 += rv[b] * rv[b];
-            sum12 += cv[b] * rv[b];
-            valid_bands++;
+// 计算ZNCC
+static inline double ZNCC(const std::vector<double>& A, double meanA, double stdA,
+    const std::vector<double>& B, double meanB, double stdB)
+{
+    if (A.size() != B.size() || stdA < 1e-9 || stdB < 1e-9) return -1.0;
+    double s = 0.0;
+    for (size_t i = 0; i < A.size(); ++i) s += (A[i] - meanA) * (B[i] - meanB);
+    return s / (double(A.size()) * stdA * stdB);
+}
+
+// 验证几何位置对应的 ZNCC（基准影像块中心(cxBase,cyBase)，半径rad，ZNCC阈值znccThr）
+static bool VerifyByZNCC(CWuErsImage& baseImg, CWuErsImage& hrImg,
+    int cxBase, int cyBase, int rad, double znccThr)
+{
+    const int colsB = baseImg.GetCols(), rowsB = baseImg.GetRows();
+    if (cxBase - rad < 0 || cyBase - rad < 0 || cxBase + rad >= colsB || cyBase + rad >= rowsB)
+        return false;
+
+    int avzX = (int)std::round(std::abs(baseImg.m_dx / hrImg.m_dx));
+    int avzY = (int)std::round(std::abs(baseImg.m_dy / hrImg.m_dy));
+    int avz = std::max(1, (int)std::round(0.5 * (avzX + avzY)));//50
+
+    const WORD* basePtr = (const WORD*)baseImg.m_pImgDat;
+    const int side = 2 * rad + 1;
+
+    std::vector<double> basePatch; basePatch.reserve(side * side);
+    std::vector<double> hrPatch;   hrPatch.reserve(side * side);
+
+    double sB = 0.0, sB2 = 0.0, sH = 0.0, sH2 = 0.0;
+    int validBoth = 0;
+
+    for (int dy = -rad; dy <= rad; ++dy) {
+        int yB = cyBase + dy;
+        const WORD* rowPtrB = basePtr + (INT64)yB * colsB * baseImg.GetBands();
+        for (int dx = -rad; dx <= rad; ++dx) {
+            int xB = cxBase + dx;
+            const WORD* pxB = rowPtrB + xB * baseImg.GetBands();
+
+            double gB = GrayFromWordBands(pxB);
+            basePatch.push_back(gB);
+
+            double gx = baseImg.m_tlX + xB * baseImg.m_dx;
+            double gy = baseImg.m_tlY - (rowsB - 1 - yB) * baseImg.m_dy;
+
+            short pv[4] = { 0,0,0,0 }; double fcx, fcy;
+            GetPxl(gx, gy, &hrImg, pv, avz, &fcx, &fcy);
+            double gH = GrayFromWordBands((const WORD*)pv);
+            hrPatch.push_back(gH);
+
+            if (gB > 0 && gH > 0) {
+                sB += gB; sB2 += gB * gB;
+                sH += gH; sH2 += gH * gH;
+                validBoth++;
+            }
         }
     }
 
-    if (valid_bands < 2) return 0; // 至少需要两个有效波段
+    if (validBoth < side * side * 7 / 10) return false;
 
-    double numerator = valid_bands * sum12 - sum1 * sum2;
-    double denominator = sqrt((valid_bands * sum11 - sum1 * sum1) *
-        (valid_bands * sum22 - sum2 * sum2));
+    double mB = sB / validBoth, mH = sH / validBoth;
+    double vB = (sB2 - sB * sB / validBoth), vH = (sH2 - sH * sH / validBoth);
+    double sBstd = (validBoth > 1 && vB > 0) ? std::sqrt(vB / (validBoth - 1)) : 0.0;
+    double sHstd = (validBoth > 1 && vH > 0) ? std::sqrt(vH / (validBoth - 1)) : 0.0;
+    if (sBstd < RAD_MIN_STD || sHstd < RAD_MIN_STD) return false;
 
-    return fabs(denominator) > 1e-6 ? numerator / denominator : 0;
+    double zn = ZNCC(basePatch, mB, sBstd, hrPatch, mH, sHstd);
+    return zn >= znccThr;
+}
+// 计算将 img 对齐到 coarse 的块平均窗口（>=2 则返回窗口尺寸，否则返回 0 表示单像元/双线性）
+static inline int CalcAvzToCoarse(const CWuErsImage& coarse, const CWuErsImage& img) {
+    double rx = std::abs(coarse.m_dx / img.m_dx);
+    double ry = std::abs(coarse.m_dy / img.m_dy);
+    if (!std::isfinite(rx) || rx <= 0) rx = 1.0;
+    if (!std::isfinite(ry) || ry <= 0) ry = 1.0;
+    int avz = (int)std::round(0.5 * (rx + ry));
+    return (avz >= 2) ? avz : 0;
 }
 
-// 计算主/参考的像元尺度比（>1 表示参考更粗，需要下采主影像）
-static inline double ComputeScaleHint(const CWuErsImage& domImg, const CWuErsImage& refImg)
-{
-    double sx = fabs(refImg.m_dx / domImg.m_dx);
-    double sy = fabs(refImg.m_dy / domImg.m_dy);
-    if (!std::isfinite(sx) || sx <= 0) sx = 1.0;
-    if (!std::isfinite(sy) || sy <= 0) sy = 1.0;
-    return 0.5 * (sx + sy);
-}
-// ========== 计算重叠掩膜（像素坐标） ==========
-static inline bool BuildOverlapMasks(CWuErsImage& dom,
-    CWuErsImage& ref,
-    cv::Mat& maskDom,
-    cv::Mat& maskRef,
-    int pad = 16)
-{
-    // dom世界范围
-    const double d_left = dom.m_tlX;
-    const double d_right = dom.m_tlX + (dom.GetCols() - 1) * dom.m_dx;
-    const double d_top = dom.m_tlY;
-    const double d_bottom = dom.m_tlY - (dom.GetRows() - 1) * dom.m_dy;
-    // ref世界范围
-    const double r_left = ref.m_tlX;
-    const double r_right = ref.m_tlX + (ref.GetCols() - 1) * ref.m_dx;
-    const double r_top = ref.m_tlY;
-    const double r_bottom = ref.m_tlY - (ref.GetRows() - 1) * ref.m_dy;
-
-    // 交集（世界坐标）
-    const double wxmin = std::max(d_left, r_left);
-    const double wxmax = std::min(d_right, r_right);
-    const double wymax = std::min(d_top, r_top);
-    const double wymin = std::max(d_bottom, r_bottom);
-    if (!(wxmin < wxmax && wymin < wymax)) {
-        maskDom = cv::Mat(); maskRef = cv::Mat();
-        return false;
-    }
-
-    // 世界->像素（列：x方向；行：自上而下）
-    auto clamp = [](int v, int lo, int hi) { return std::max(lo, std::min(hi, v)); };
-
-    // dom像素矩形
-    int d_cL = (int)std::floor((wxmin - dom.m_tlX) / dom.m_dx) - pad;
-    int d_cR = (int)std::ceil((wxmax - dom.m_tlX) / dom.m_dx) + pad;
-    int d_rT = (int)std::floor((dom.m_tlY - wymax) / dom.m_dy) - pad; // 注意顶->小行号
-    int d_rB = (int)std::ceil((dom.m_tlY - wymin) / dom.m_dy) + pad;
-
-    d_cL = clamp(d_cL, 0, dom.GetCols() - 1);
-    d_cR = clamp(d_cR, 0, dom.GetCols() - 1);
-    d_rT = clamp(d_rT, 0, dom.GetRows() - 1);
-    d_rB = clamp(d_rB, 0, dom.GetRows() - 1);
-    if (d_cL >= d_cR || d_rT >= d_rB) {
-        maskDom = cv::Mat(); maskRef = cv::Mat();
-        return false;
-    }
-
-    // ref像素矩形
-    int r_cL = (int)std::floor((wxmin - ref.m_tlX) / ref.m_dx) - pad;
-    int r_cR = (int)std::ceil((wxmax - ref.m_tlX) / ref.m_dx) + pad;
-    int r_rT = (int)std::floor((ref.m_tlY - wymax) / ref.m_dy) - pad;
-    int r_rB = (int)std::ceil((ref.m_tlY - wymin) / ref.m_dy) + pad;
-
-    r_cL = clamp(r_cL, 0, ref.GetCols() - 1);
-    r_cR = clamp(r_cR, 0, ref.GetCols() - 1);
-    r_rT = clamp(r_rT, 0, ref.GetRows() - 1);
-    r_rB = clamp(r_rB, 0, ref.GetRows() - 1);
-    if (r_cL >= r_cR || r_rT >= r_rB) {
-        maskDom = cv::Mat(); maskRef = cv::Mat();
-        return false;
-    }
-
-    maskDom = cv::Mat::zeros(dom.GetRows(), dom.GetCols(), CV_8U);
-    maskRef = cv::Mat::zeros(ref.GetRows(), ref.GetCols(), CV_8U);
-    cv::rectangle(maskDom, cv::Rect(d_cL, d_rT, d_cR - d_cL + 1, d_rB - d_rT + 1), cv::Scalar(255), cv::FILLED);
-    cv::rectangle(maskRef, cv::Rect(r_cL, r_rT, r_cR - r_cL + 1, r_rB - r_rT + 1), cv::Scalar(255), cv::FILLED);
-    return true;
-}
-
-#ifdef USE_OPENCV_MATCH
+// 并行收集结果的记录
+struct RadZNCCRec {
+    int cxDom, cyDom;     // 主影像像素（顶->下）
+    int cxRef, cyRef;     // 参考影像像素（顶->下）
+    short cv[4], rv[4];   // 主/参考 4波段
+    double sz, vz, as;    // 主影像太阳参数
+    double sz1, vz1, as1; // 参考影像太阳参数
+};
+//////////////////////////////////////////////////////////////////////////////////
 static void WuErsToGray8(CWuErsImage& img, cv::Mat& outGray)
 {
     int cols = img.GetCols();
@@ -1514,8 +1265,8 @@ static void SaveMatchesPlotFromOlp(CWuErsImage& domImg,
     COlpFile& olp,
     const char* outPath)
 {
-    int oz = 0; const OBV* p = olp.GetData(&oz);
-    if (!p || oz <= 0) return;
+    int oz = 0; const OBV* pData = olp.GetData(&oz);
+    if (!pData || oz <= 0) return;
 
     cv::Mat gL0, gR0;
     WuErsToGray8(domImg, gL0);
@@ -1527,7 +1278,6 @@ static void SaveMatchesPlotFromOlp(CWuErsImage& domImg,
     const double gsdCoarse = std::max(gsdL, gsdR);
     double sL = (gsdL > 0) ? (gsdL / gsdCoarse) : 1.0; // <=1
     double sR = (gsdR > 0) ? (gsdR / gsdCoarse) : 1.0; // <=1
-    // 避免宽或高为0
     auto safeSize = [](int v, double s) { return std::max(1, (int)std::round(v * s)); };
 
     cv::Mat gL, gR;
@@ -1543,9 +1293,55 @@ static void SaveMatchesPlotFromOlp(CWuErsImage& domImg,
     cv::cvtColor(gL, roiL, cv::COLOR_GRAY2BGR);
     cv::cvtColor(gR, roiR, cv::COLOR_GRAY2BGR);
 
+    // 计算每个点矩形框的半宽（画布坐标，已考虑缩放）
+    int halfBoxL = 6;
+    int halfBoxR = 6;
+    double minXL = 1e30, minYL = 1e30, maxXL = -1e30, maxYL = -1e30;
+    double minXR = 1e30, minYR = 1e30, maxXR = -1e30, maxYR = -1e30;
+    {
+        const OBV* pAll = olp.GetData(&oz);
+        for (int i = 0; i < oz; ++i) {
+            const OBV& o = pAll[i];
+            double rL_top = (gL0.rows - 1 - o.cr) * sL;
+            double rR_top = (gR0.rows - 1 - o.rr) * sR;
+            double cL_s = o.cc * sL;
+            double cR_s = o.rc * sR;
+
+            if (cL_s >= 0 && rL_top >= 0 && cL_s < WL && rL_top < gL.rows) {
+                minXL = std::min(minXL, cL_s);
+                minYL = std::min(minYL, rL_top);
+                maxXL = std::max(maxXL, cL_s);
+                maxYL = std::max(maxYL, rL_top);
+            }
+            if (cR_s >= 0 && rR_top >= 0 && cR_s < WR && rR_top < gR.rows) {
+                minXR = std::min(minXR, cR_s);
+                minYR = std::min(minYR, rR_top);
+                maxXR = std::max(maxXR, cR_s);
+                maxYR = std::max(maxYR, rR_top);
+            }
+        }
+        // 画全局包围盒（左右图分别）
+        if (minXL < maxXL && minYL < maxYL) {
+            cv::Rect rL((int)std::floor(std::max(0.0, minXL - halfBoxL)),
+                (int)std::floor(std::max(0.0, minYL - halfBoxL)),
+                (int)std::ceil(std::min<double>(WL - 1, maxXL + halfBoxL)) - (int)std::floor(std::max(0.0, minXL - halfBoxL)),
+                (int)std::ceil(std::min<double>(gL.rows - 1, maxYL + halfBoxL)) - (int)std::floor(std::max(0.0, minYL - halfBoxL)));
+            rL &= cv::Rect(0, 0, WL, gL.rows);
+            cv::rectangle(canvas, rL, cv::Scalar(0, 255, 0), 2, cv::LINE_AA);
+        }
+        if (minXR < maxXR && minYR < maxYR) {
+            cv::Rect rR((int)std::floor(std::max(0.0, minXR - halfBoxR)) + WL,
+                (int)std::floor(std::max(0.0, minYR - halfBoxR)),
+                (int)std::ceil(std::min<double>(WR - 1, maxXR + halfBoxR)) - (int)std::floor(std::max(0.0, minXR - halfBoxR)),
+                (int)std::ceil(std::min<double>(gR.rows - 1, maxYR + halfBoxR)) - (int)std::floor(std::max(0.0, minYR - halfBoxR)));
+            rR &= cv::Rect(WL, 0, WR, gR.rows);
+            cv::rectangle(canvas, rR, cv::Scalar(255, 0, 0), 2, cv::LINE_AA);
+        }
+    }
+    // 逐点绘制
     cv::RNG rng(12345);
-    for (int i = 0; i < oz; ++i, ++p) {
-        // .olp 存的是底->上的行号，这里转回顶->下，再乘以显示缩放
+    const OBV* p = pData;
+    for (int i = 0; i < oz; i += 10, p += 10) { // 仍旧抽样绘制，避免过密
         double rL_top = (gL0.rows - 1 - p->cr) * sL;
         double rR_top = (gR0.rows - 1 - p->rr) * sR;
         double cL_s = p->cc * sL;
@@ -1562,142 +1358,17 @@ static void SaveMatchesPlotFromOlp(CWuErsImage& domImg,
         cv::circle(canvas, pR, 2, col, -1, cv::LINE_AA);
         cv::line(canvas, pL, pR, col, 1, cv::LINE_AA);
     }
+
     cv::imwrite(outPath, canvas);
 }
 
-static void SaveMatchesPlotVec(CWuErsImage& domImg,
-    CWuErsImage& refImg,
-    const std::vector<cv::Point2f>& ptsDom,
-    const std::vector<cv::Point2f>& ptsRef,
-    const char* outPath)
-{
-    if (ptsDom.empty() || ptsDom.size() != ptsRef.size()) return;
-
-    cv::Mat gL0, gR0;
-    WuErsToGray8(domImg, gL0);
-    WuErsToGray8(refImg, gR0);
-
-    const double gsdL = std::abs(domImg.m_dx);
-    const double gsdR = std::abs(refImg.m_dx);
-    const double gsdCoarse = std::max(gsdL, gsdR);
-    double sL = (gsdL > 0) ? (gsdL / gsdCoarse) : 1.0;
-    double sR = (gsdR > 0) ? (gsdR / gsdCoarse) : 1.0;
-    auto safeSize = [](int v, double s) { return std::max(1, (int)std::round(v * s)); };
-
-    cv::Mat gL, gR;
-    cv::resize(gL0, gL, cv::Size(safeSize(gL0.cols, sL), safeSize(gL0.rows, sL)), 0, 0, cv::INTER_AREA);
-    cv::resize(gR0, gR, cv::Size(safeSize(gR0.cols, sR), safeSize(gR0.rows, sR)), 0, 0, cv::INTER_AREA);
-
-    const int WL = gL.cols, WR = gR.cols;
-    const int H = std::max(gL.rows, gR.rows);
-
-    cv::Mat canvas(H, WL + WR, CV_8UC3, cv::Scalar(0, 0, 0));
-    cv::Mat roiL = canvas(cv::Rect(0, 0, WL, gL.rows));
-    cv::Mat roiR = canvas(cv::Rect(WL, 0, WR, gR.rows));
-    cv::cvtColor(gL, roiL, cv::COLOR_GRAY2BGR);
-    cv::cvtColor(gR, roiR, cv::COLOR_GRAY2BGR);
-
-    cv::RNG rng(12345);
-    for (size_t i = 0; i < ptsDom.size(); ++i) {
-        cv::Point2f pL(ptsDom[i].x * (float)sL, ptsDom[i].y * (float)sL);
-        cv::Point2f pR(ptsRef[i].x * (float)sR + WL, ptsRef[i].y * (float)sR);
-
-        if (pL.x < 0 || pL.y < 0 || pL.x >= WL || pL.y >= gL.rows) continue;
-        if (pR.x < WL || pR.y < 0 || pR.x >= WL + WR || pR.y >= gR.rows) continue;
-
-        cv::Scalar col(rng.uniform(0, 255), rng.uniform(0, 255), rng.uniform(0, 255));
-        cv::circle(canvas, pL, 2, col, -1, cv::LINE_AA);
-        cv::circle(canvas, pR, 2, col, -1, cv::LINE_AA);
-        cv::line(canvas, pL, pR, col, 1, cv::LINE_AA);
-    }
-    cv::imwrite(outPath, canvas);
-}
-
-static inline void ApplyCLAHE(cv::Mat& img) {
-    // 遥感图像动态范围大，CLAHE比全局均衡更稳
-    cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(3.0, cv::Size(32, 32));
-    clahe->apply(img, img);
-}
-
-struct ORBMatchResult {
-    std::vector<cv::Point2f> ptsDom; // 主影像
-    std::vector<cv::Point2f> ptsRef; // 参考影像
-};
-
-static ORBMatchResult RunORBMatch(CWuErsImage& domImg,
-    CWuErsImage& refImg,
-    int maxFeatures = 40000,
-    float scaleFactor = 1.2f,
-    int nLevels = 8,
-    float ratio = 0.75f,
-    double ransacThresh = 2.0,
-    double ransacConf = 0.999,
-    const cv::Mat* maskDom = nullptr,
-    const cv::Mat* maskRef = nullptr)
-{
-    ORBMatchResult res;
-
-    cv::Mat gDom, gRef;
-    WuErsToGray8(domImg, gDom);
-    WuErsToGray8(refImg, gRef);
-
-    ApplyCLAHE(gDom);
-    ApplyCLAHE(gRef);
-
-    cv::Ptr<cv::ORB> orb = cv::ORB::create(maxFeatures, scaleFactor, nLevels);
-    std::vector<cv::KeyPoint> kptsDom, kptsRef;
-    cv::Mat descDom, descRef;
-    if (maskDom && !maskDom->empty())
-        orb->detectAndCompute(gDom, *maskDom, kptsDom, descDom);
-    else
-        orb->detectAndCompute(gDom, cv::noArray(), kptsDom, descDom);
-
-    if (maskRef && !maskRef->empty())
-        orb->detectAndCompute(gRef, *maskRef, kptsRef, descRef);
-    else
-        orb->detectAndCompute(gRef, cv::noArray(), kptsRef, descRef);
-
-    if (descDom.empty() || descRef.empty()) return res;
-
-    cv::BFMatcher matcher(cv::NORM_HAMMING, false);
-    std::vector<std::vector<cv::DMatch>> knn;
-    matcher.knnMatch(descDom, descRef, knn, 2);
-
-    std::vector<cv::Point2f> q1, q2;
-    q1.reserve(knn.size());
-    q2.reserve(knn.size());
-
-    for (auto& k : knn) {
-        if (k.size() < 2) continue;
-        if (k[0].distance < ratio * k[1].distance) {
-            q1.push_back(kptsDom[k[0].queryIdx].pt);
-            q2.push_back(kptsRef[k[0].trainIdx].pt);
-        }
-    }
-    if (q1.size() < 8) return res;
-
-    std::vector<unsigned char> inlierMask;
-    cv::Mat F = cv::findFundamentalMat(q1, q2, cv::FM_RANSAC, ransacThresh, ransacConf, inlierMask);
-    if (F.empty()) return res;
-
-    for (size_t i = 0; i < q1.size(); ++i) {
-        if (inlierMask[i]) {
-            res.ptsDom.push_back(q1[i]);
-            res.ptsRef.push_back(q2[i]);
-        }
-    }
-    return res;
-}
-#endif
-
+/////////////////////////////////////////////////////////////////////////////
 BOOL MchTie(LPCSTR lpstrPar)
 {
     char strSrc[256], strRef[256], strTsk[256], str[512], strOlp[512];
     double fc, fr, fc1, fr1, sz, vz, as, sz1, vz1, as1;
     double cx, cy, cz, phi, img, kap, grdZ, cx1, cy1, cz1, phi1, img1, kap1, grdZ1;
     int idx, yy, mm, dd, ho, mi, se, yy1, mm1, dd1, ho1, mi1, se1, utmZn = 0, gs = 21, ws = 5, bTxt = 0;
-
-    double minCorr = 0.7;    // 辐射相关性最小阈值
 
     const char* pS = strrchr(lpstrPar, '@'); if (pS) { pS++; while (*pS == ' ') pS++; }
     else pS = lpstrPar; strcpy(strTsk, pS);
@@ -1754,117 +1425,128 @@ BOOL MchTie(LPCSTR lpstrPar)
         char strPlot[512]; strcpy(strPlot, strOlp);
         char* pExtPng = strrchr(strPlot, '.'); if (pExtPng) strcpy(pExtPng, ".png"); else strcat(strPlot, ".png");
         int tieSum = 0, vSum = 0, cSum = 0;
-        //bool usedExistingOlp = false;
-        //std::vector<cv::Point2f> plotDom, plotRef; // 非现有 .olp 流程用于绘图
 
-        // 先尝试使用现有 .olp
-        //if (IsExist(strOlp) && olpF.Load4File(strOlp)) {
-        //    int oz = 0; olpF.GetData(&oz);
-        //    tieSum = oz;
-        //    usedExistingOlp = true;
-        //    cprintf("Use existing OLP: %s tieSum=%d\n", strOlp, tieSum);
-        //}
-        //else {
+        // 现有 .olp
+        if (/*IsExist(strOlp) && olpF.Load4File(strOlp)*/FALSE) {
+            SaveMatchesPlotFromOlp(domImg, basImg, olpF, strPlot);
+        }
+        else {
             // 无 .olp，执行匹配生成
             olpF.SetSize(0); rowsr = basImg.GetRows();
 
-#ifdef USE_OPENCV_MATCH
-            // 计算重叠掩膜（像素域）
-            cv::Mat maskDom, maskRef;
-            // 仅当非绝对基准时才尝试 ORB；绝对基准用地理坐标采样
-            if (idx == -1) {
-                // —— 绝对基准：用地理坐标采样（复用非OpenCV分支的逻辑）——
-                rowsr = basImg.GetRows();
-                for (r = 1; r < rows - gs; r += gs) {
-                    for (c = 1; c < cols - gs; c += gs) {
-                        short* pC = (short*)(domImg.m_pImgDat + (r * cols + c) * pxSz);
-                        if (pC[0] == 0 && pC[1] == 0 && pC[2] == 0) continue;
+#ifdef USE_MY_MATCH
+            const int rowsD = domImg.GetRows();
+            const int colsD = domImg.GetCols();
 
-                        gx = domImg.m_tlX + c * domImg.m_dx;
-                        gy = domImg.m_tlY - (rows - 1 - r) * domImg.m_dy;
-                        gz = grdZ;
-                        if (!GetPxl(gx, gy, &domImg, cv, ws, &fc, &fr)) continue;
-                        if (cv[0] == 0 && cv[1] == 0 && cv[2] == 0) continue;
-                        if (!GetPxl(gx, gy, &basImg, rv, /*绝对基准时*/0, &fc1, &fr1)) continue;
-                        if (rv[0] == 0 && rv[1] == 0 && rv[2] == 0) continue;
-                        if (rv[0] < 0 || rv[1] < 0 || rv[2] < 0 || rv[3] < 0 || cv[0] < 0 || cv[1] < 0 || cv[2] < 0 || cv[3] < 0) {
-                            vSum++;
-                            continue;
+            // 自动选择较粗影像为基准尺度（粗影像直接取像元，细影像用块平均）
+            const double gsdDom = std::abs(domImg.m_dx);
+            const double gsdRef = std::abs(basImg.m_dx);
+            const bool domIsCoarse = (gsdDom > gsdRef);
+            const bool sameRes = (gsdDom == gsdRef);
+            const CWuErsImage& coarseImg = domIsCoarse ? domImg : basImg;
+
+            const int avzDom = sameRes ? 0 : CalcAvzToCoarse(coarseImg, domImg);
+            const int avzRef = sameRes ? 0 : CalcAvzToCoarse(coarseImg, basImg);
+
+            std::vector<RadZNCCRec> allRecs;
+            allRecs.reserve(((rowsD / gs) + 1) * ((colsD / gs) + 1) / 2);
+
+#ifdef _OPENMP
+#pragma omp parallel
+#endif
+            {
+                std::vector<RadZNCCRec> localRecs;
+                localRecs.reserve(2048);
+                int vLocal = 0, cLocal = 0;
+
+#ifdef _OPENMP
+#pragma omp for schedule(dynamic, 32) nowait
+#endif
+                for (int rr = 1; rr < rowsD - gs; rr += gs) {
+                    for (int cc = 1; cc < colsD - gs; cc += gs) {
+                        double gx_l = domImg.m_tlX + cc * domImg.m_dx;
+                        double gy_l = domImg.m_tlY - (rowsD - 1 - rr) * domImg.m_dy;
+                        double gz_l = grdZ;
+
+                        short cv_l[4], rv_l[4];
+                        double fc_l, fr_l, fc1_l, fr1_l;
+                        if (!GetPxl(gx_l, gy_l, &domImg, cv_l, avzDom, &fc_l, &fr_l)) continue;
+                        if (cv_l[0] == 0 && cv_l[1] == 0 && cv_l[2] == 0) continue;
+                        if (!GetPxl(gx_l, gy_l, &basImg, rv_l, avzRef, &fc1_l, &fr1_l)) continue;
+                        if (rv_l[0] == 0 && rv_l[1] == 0 && rv_l[2] == 0) continue;
+                        if (rv_l[0] < 0 || rv_l[1] < 0 || rv_l[2] < 0 || rv_l[3] < 0 ||
+                            cv_l[0] < 0 || cv_l[1] < 0 || cv_l[2] < 0 || cv_l[3] < 0) {
+                            vLocal++; continue;
                         }
-                        //double corr = CalculateRadiationCorrelation(cv, rv);
-                        //if (corr < minCorr) {
-                        //    cSum++;
-                        //    continue;
-                        //}
+                        // ZNCC 验证
+                        int verifyR = std::max(3, RAD_PATCH_RADIUS);
+                        bool ok = false;
+                        if (domIsCoarse) {
+                            int cxBase = (int)std::round(fc_l);
+                            int cyBase = (int)std::round(fr_l);
+                            ok = VerifyByZNCC(domImg, basImg, cxBase, cyBase, verifyR, RAD_MIN_ZNCC);
+                        }
+                        else {
+                            int cxBase = (int)std::round(fc1_l);
+                            int cyBase = (int)std::round(fr1_l);
+                            ok = VerifyByZNCC(basImg, domImg, cxBase, cyBase, verifyR, RAD_MIN_ZNCC);
+                        }
+                        if (!ok) { cLocal++; continue; }
 
-                        geoCvt.Cvt_Prj2LBH(gx, gy, gz, &lon, &lat, &hei);
-                        getSunPos(gx, gy, gz, cx, cy, cz, lon * SPGC_R2D, lat * SPGC_R2D, yy, mm, dd, ho, mi, se, &sz, &vz, &as);
-                        if (yy1 == 0) { sz1 = vz1 = as1 = 0; }
-                        else getSunPos(gx, gy, gz, cx1, cy1, cz1, lon * SPGC_R2D, lat * SPGC_R2D, yy1, mm1, dd1, ho1, mi1, se1, &sz1, &vz1, &as1);
+                        // 太阳参数（逐点独立）
+                        double lon_l, lat_l, hei_l, sz_l, vz_l, as_l, sz1_l = 0, vz1_l = 0, as1_l = 0;
+                        geoCvt.Cvt_Prj2LBH(gx_l, gy_l, gz_l, &lon_l, &lat_l, &hei_l);
+                        getSunPos(gx_l, gy_l, gz_l, cx, cy, cz,
+                            lon_l * SPGC_R2D, lat_l * SPGC_R2D,
+                            yy, mm, dd, ho, mi, se,
+                            &sz_l, &vz_l, &as_l);
+                        if (yy1 != 0) {
+                            getSunPos(gx_l, gy_l, gz_l, cx1, cy1, cz1,
+                                lon_l * SPGC_R2D, lat_l * SPGC_R2D,
+                                yy1, mm1, dd1, ho1, mi1, se1,
+                                &sz1_l, &vz1_l, &as1_l);
+                        }
 
-                        tieSum++;
-                        olpF.Append(sz, vz, as, int(fc), int(rows - 1 - fr), cv, sz1, vz1, as1, int(fc1), int(rowsr - 1 - fr1), rv);
+                        // 收集
+                        RadZNCCRec rec{};
+                        rec.cxDom = (int)std::round(fc_l);
+                        rec.cyDom = (int)std::round(fr_l);
+                        rec.cxRef = (int)std::round(fc1_l);
+                        rec.cyRef = (int)std::round(fr1_l);
+                        rec.cv[0] = cv_l[0]; rec.cv[1] = cv_l[1]; rec.cv[2] = cv_l[2]; rec.cv[3] = cv_l[3];
+                        rec.rv[0] = rv_l[0]; rec.rv[1] = rv_l[1]; rec.rv[2] = rv_l[2]; rec.rv[3] = rv_l[3];
+                        rec.sz = sz_l; rec.vz = vz_l; rec.as = as_l;
+                        rec.sz1 = sz1_l; rec.vz1 = vz1_l; rec.as1 = as1_l;
 
-                        // 为可视化保存像素坐标（顶->下坐标系，绘图函数已做GSD归一）
-                        //plotDom.emplace_back((float)fc, (float)fr);
-                        //plotRef.emplace_back((float)fc1, (float)fr1);
+                        localRecs.emplace_back(rec);
                     }
                 }
-                cprintf("Geo tieSum=%d, skip(value<=0)=%d corrSkip=%d\n", tieSum, vSum, cSum);
-            }
-            else {
-                // —— 非绝对基准：用 ORB 多尺度 + 掩膜 —— 
-                if (!BuildOverlapMasks(domImg, basImg, maskDom, maskRef, /*pad=*/128)) {
-                    cprintf("No overlap, skip pair.\n");
-                    continue;
+
+#ifdef _OPENMP
+#pragma omp critical
+#endif
+                {
+                    allRecs.insert(allRecs.end(), localRecs.begin(), localRecs.end());
+                    vSum += vLocal; cSum += cLocal;
                 }
+            } // end parallel
 
-                ORBMatchResult fm = RunORBMatch(domImg, basImg,
-                    /*maxFeatures*/40000, /*scaleFactor*/1.2f,
-                    /*nLevels*/8, /*ratio*/0.80f,
-                    /*ransacThresh*/3.0, /*ransacConf*/0.999,
-                    /*maskDom*/ &maskDom, /*maskRef*/ &maskRef);
-                cprintf("ORB inliers = %zu\n", fm.ptsDom.size());
-
-                //plotDom.reserve(fm.ptsDom.size()); plotRef.reserve(fm.ptsRef.size());
-
-                // 生成 .olp
-                for (size_t k = 0; k < fm.ptsDom.size(); ++k) {
-                    float fc = fm.ptsDom[k].x;
-                    float fr = fm.ptsDom[k].y;
-                    float fc1 = fm.ptsRef[k].x;
-                    float fr1 = fm.ptsRef[k].y;
-
-                    if (fc < 0 || fr < 0 || fc >= cols || fr >= rows) continue;
-                    if (fc1 < 0 || fr1 < 0 || fc1 >= basImg.GetCols() || fr1 >= rowsr) continue;
-
-                    short cv[4] = { 0,0,0,0 }, rv[4] = { 0,0,0,0 };
-                    const WORD* pD = (const WORD*)domImg.m_pImgDat + (INT64)int(fr) * cols * bnds + int(fc) * bnds;
-                    const WORD* pR = (const WORD*)basImg.m_pImgDat + (INT64)int(fr1) * basImg.GetCols() * bnds + int(fc1) * bnds;
-                    for (int b = 0; b < bnds && b < 4; b++) { cv[b] = (short)pD[b]; rv[b] = (short)pR[b]; }
-                    if (cv[0] == 0 && cv[1] == 0 && cv[2] == 0) continue;
-                    if (rv[0] == 0 && rv[1] == 0 && rv[2] == 0) continue;
-                    if (rv[0] < 0 || rv[1] < 0 || rv[2] < 0 || rv[3] < 0 || cv[0] < 0 || cv[1] < 0 || cv[2] < 0 || cv[3] < 0) {
-                        continue;
-                    }
-                    gx = domImg.m_tlX + fc * domImg.m_dx;
-                    gy = domImg.m_tlY - (rows - 1 - fr) * domImg.m_dy;
-                    gz = grdZ;
-                    geoCvt.Cvt_Prj2LBH(gx, gy, gz, &lon, &lat, &hei);
-                    getSunPos(gx, gy, gz, cx, cy, cz, lon * SPGC_R2D, lat * SPGC_R2D, yy, mm, dd, ho, mi, se, &sz, &vz, &as);
-                    if (yy1 == 0) { sz1 = vz1 = as1 = 0; }
-                    else getSunPos(gx, gy, gz, cx1, cy1, cz1, lon * SPGC_R2D, lat * SPGC_R2D, yy1, mm1, dd1, ho1, mi1, se1, &sz1, &vz1, &as1);
-
-                    olpF.Append(sz, vz, as,
-                        int(fc), int(rows - 1 - fr), cv,
-                        sz1, vz1, as1,
-                        int(fc1), int(rowsr - 1 - fr1), rv);
-                    //plotDom.emplace_back(fc, fr);
-                    //plotRef.emplace_back(fc1, fr1);
-                    tieSum++;
-                }
-                cprintf("ORB tieSum=%d\n", tieSum);
+            // 统一输出到 .olp（.olp 行号为“底->上”）
+            for (const auto& rec : allRecs) {
+                olpF.Append(rec.sz, rec.vz, rec.as,
+                    rec.cxDom, int(rows - 1 - rec.cyDom), const_cast<short*>(rec.cv),
+                    rec.sz1, rec.vz1, rec.as1,
+                    rec.cxRef, int(rowsr - 1 - rec.cyRef), const_cast<short*>(rec.rv));
             }
+            tieSum += (int)allRecs.size();
+            cprintf("tieSum=%d (threads=%d, gs=%d, verifyR=%d, thr=%.2f) skip(value<=0)=%d verifySkip=%d\n",
+                (int)allRecs.size(),
+#ifdef _OPENMP
+                omp_get_max_threads(),
+#else
+                1,
+#endif
+                gs, std::max(3, RAD_PATCH_RADIUS), RAD_MIN_ZNCC, vSum, cSum);
 #else
             for (r = 1; r < rows - gs; r += gs) {
                 for (c = 1; c < cols - gs; c += gs) {
@@ -1882,11 +1564,6 @@ BOOL MchTie(LPCSTR lpstrPar)
                         vSum++;
                         continue;
                     }
-                    double corr = CalculateRadiationCorrelation(cv, rv);
-                    if (corr < minCorr) {
-                        cSum++;
-                        continue;
-                    }
                     geoCvt.Cvt_Prj2LBH(gx, gy, gz, &lon, &lat, &hei);
                     getSunPos(gx, gy, gz, cx, cy, cz, lon * SPGC_R2D, lat * SPGC_R2D, yy, mm, dd, ho, mi, se, &sz, &vz, &as);
                     if (yy1 == 0) { sz1 = vz1 = as1 = 0; }
@@ -1898,21 +1575,13 @@ BOOL MchTie(LPCSTR lpstrPar)
             }
             cprintf("tieSum= %d, skip (value<=0)=%d correlation=%d\n", tieSum, vSum, cSum);
 #endif
-        //}
-        if (olpF.GetSize() > 0) {
-            olpF.Save2File(strOlp);
-            if (bTxt) {
-                char strTxt[512]; strcpy(strTxt, strOlp); strcat(strTxt, ".txt");
-                olpF.Save2File(strTxt, FALSE);
+            if (olpF.GetSize() > 0) {
+                olpF.Save2File(strOlp);
+                if (bTxt) {
+                    char strTxt[512]; strcpy(strTxt, strOlp); strcat(strTxt, ".txt");
+                    olpF.Save2File(strTxt, FALSE);
+                }
             }
-//#ifdef USE_OPENCV_MATCH
-//            if (usedExistingOlp) {
-//                SaveMatchesPlotFromOlp(domImg, basImg, olpF, strPlot);
-//            }
-//            else if (!plotDom.empty()) {
-//                SaveMatchesPlotVec(domImg, basImg, plotDom, plotRef, strPlot);
-//            }
-//#endif
         }
     }
     fclose(fTsk);
