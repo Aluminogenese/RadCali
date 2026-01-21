@@ -1,4 +1,4 @@
-// RadCaliDlg.cpp : implementation file
+ï»¿// RadCaliDlg.cpp : implementation file
 //
 /*----------------------------------------------------------------------+
 |		RadCaliDlg														|
@@ -30,13 +30,13 @@
 #pragma comment(lib,"opencv_imgproc490d.lib")
 #define USE_MY_MATCH
 #ifndef RAD_PATCH_RADIUS
-#define RAD_PATCH_RADIUS   3    // ²¹¶¡°ë¾¶ => 9x9 patch
+#define RAD_PATCH_RADIUS   3    // è¡¥ä¸åŠå¾„ => 9x9 patch
 #endif
 #ifndef RAD_MIN_STD
-#define RAD_MIN_STD        1.0  // ×îĞ¡±ê×¼²î£¨»Ò¶È£©
+#define RAD_MIN_STD        1.0  // æœ€å°æ ‡å‡†å·®ï¼ˆç°åº¦ï¼‰
 #endif
 #ifndef RAD_MIN_ZNCC
-#define RAD_MIN_ZNCC       0.7 // ×îĞ¡ ZNCC ãĞÖµ
+#define RAD_MIN_ZNCC       0.7 // æœ€å° ZNCC é˜ˆå€¼
 #endif
 
 #ifdef _DEBUG
@@ -45,25 +45,25 @@
 static char THIS_FILE[] = __FILE__;
 #endif
 
-#define TSK_STA_READY   "µÈ´ıÖ´ĞĞ"
-#define TSK_STA_SEND    "Ìá½»ÈÎÎñ..."
-#define TSK_STA_RUN     "ÈÎÎñÖ´ĞĞÖĞ..."
-#define TSK_STA_OVER    "ÈÎÎñÍê³É"
-#define TSK_STA_EXIT    "³ÌĞòÍË³ö"
-#define TSK_STA_TERM    "Ö´ĞĞ±»È¡Ïû"
+#define TSK_STA_READY   "ç­‰å¾…æ‰§è¡Œ"
+#define TSK_STA_SEND    "æäº¤ä»»åŠ¡..."
+#define TSK_STA_RUN     "ä»»åŠ¡æ‰§è¡Œä¸­..."
+#define TSK_STA_OVER    "ä»»åŠ¡å®Œæˆ"
+#define TSK_STA_EXIT    "ç¨‹åºé€€å‡º"
+#define TSK_STA_TERM    "æ‰§è¡Œè¢«å–æ¶ˆ"
 
-#define USE_ITERATIVE_SOLVER 1     // Ê¹ÓÃµü´úÇó½âÆ÷
-#define STREAM_PROCESSING 1        // Á÷Ê½´¦ÀíÄ£Ê½
-#define CHUNK_SIZE 10000          // Êı¾İ¿é´óĞ¡
-#define MAX_SOLVER_ITERATIONS 1000 // ×î´óµü´ú´ÎÊı
-#define SOLVER_TOLERANCE 1e-8      // Çó½â¾«¶È
+#define USE_ITERATIVE_SOLVER 1     // ä½¿ç”¨è¿­ä»£æ±‚è§£å™¨
+#define STREAM_PROCESSING 1        // æµå¼å¤„ç†æ¨¡å¼
+#define CHUNK_SIZE 10000          // æ•°æ®å—å¤§å°
+#define MAX_SOLVER_ITERATIONS 1000 // æœ€å¤§è¿­ä»£æ¬¡æ•°
+#define SOLVER_TOLERANCE 1e-8      // æ±‚è§£ç²¾åº¦
 
 #define MAX_CPU             64
 static HWND  gs_hWnd;
 static ULONG gs_hThreadId[MAX_CPU];
 static ULONG gs_hProcId[MAX_CPU];
 static char  gs_strCmd[MAX_CPU][1024];
-DWORD WINAPI CupThread_CRadCaliDlg( LPVOID lpParam ) // Ïß³ÌÈë¿Úº¯Êı
+DWORD WINAPI CupThread_CRadCaliDlg( LPVOID lpParam ) // çº¿ç¨‹å…¥å£å‡½æ•°
 {
     ULONG id = GetCurrentThreadId(); int i,tskId=0; char str[512];
     for ( i=0;i<MAX_CPU;i++ ){ if ( gs_hThreadId[i]==id ) break; }
@@ -127,7 +127,7 @@ class CRadCaliApp : public CWinApp
 public:
     CRadCaliApp(){};
     virtual BOOL InitInstance(){ 
-    // ¿ØÖÆÌ¨Êä³ö
+    // æ§åˆ¶å°è¾“å‡º
         char szBuf[256]; ::GetModuleFileName(NULL,szBuf,sizeof(szBuf));
         strcpy( strrchr(szBuf,'\\'),"\\debug.flag" ); 
         if ( IsExist(szBuf) ){ AllocConsole(); SetConsoleCtrlHandler( (PHANDLER_ROUTINE)CtrlHandler,TRUE ); }
@@ -645,6 +645,94 @@ int comRI(const void *pA,const void *pB){
     return int(((RI*)pB)->area-((RI*)pA)->area);
 }
 
+inline bool CholeskyDecomposition(double* A, int n, double* L) {
+    memset(L, 0, sizeof(double) * n * n);
+
+    for (int i = 0; i < n; i++) {
+        for (int j = 0; j <= i; j++) {
+            double sum = 0.0;
+
+            if (i == j) {
+                for (int k = 0; k < j; k++) {
+                    sum += L[i * n + k] * L[i * n + k];
+                }
+                double diag = A[i * n + i] - sum;
+
+                if (diag <= 1e-12) return false;
+                L[i * n + j] = sqrt(diag);
+            }
+            else {
+                for (int k = 0; k < j; k++) {
+                    sum += L[i * n + k] * L[j * n + k];
+                }
+                L[i * n + j] = (A[i * n + j] - sum) / L[j * n + j];
+            }
+        }
+    }
+    return true;
+}
+
+// Choleskyæ±‚è§£
+inline bool CholeskySolve(double* A, double* b, double* x, int n) {
+    double* L = new double[n * n];
+
+    if (!CholeskyDecomposition(A, n, L)) {
+        delete[] L;
+        return false;
+    }
+
+    // å‰å‘æ›¿æ¢ L*y = b
+    double* y = new double[n];
+    for (int i = 0; i < n; i++) {
+        double sum = 0.0;
+        for (int j = 0; j < i; j++) {
+            sum += L[i * n + j] * y[j];
+        }
+        y[i] = (b[i] - sum) / L[i * n + i];
+    }
+
+    // å›ä»£ L^T*x = y
+    for (int i = n - 1; i >= 0; i--) {
+        double sum = 0.0;
+        for (int j = i + 1; j < n; j++) {
+            sum += L[j * n + i] * x[j];
+        }
+        x[i] = (y[i] - sum) / L[i * n + i];
+    }
+
+    delete[] L;
+    delete[] y;
+    return true;
+}
+
+// è§‚æµ‹å€¼ç»“æ„ï¼ˆè½»é‡çº§ï¼‰
+struct Observation {
+    int idx;        // å½±åƒç´¢å¼•
+    int idxr;       // å‚è€ƒå½±åƒç´¢å¼•ï¼ˆ-1è¡¨ç¤ºåŸºçº¿ï¼‰
+    int band;       // æ³¢æ®µ
+    double k1, k2;  // ç³»æ•°
+    double k1r, k2r;
+    double cv, rv;  // DNå€¼ï¼ˆå·²å½’ä¸€åŒ–ï¼‰
+    double init_weight;  // åˆå§‹æƒé‡
+    double weight;       // å½“å‰æƒé‡
+    double residual;     // æ®‹å·®
+};
+
+// IGG3æƒå‡½æ•°
+inline double IGG3Weight(double std_residual, double init_weight, double k0 = 2.0, double k1 = 4.0) {
+    double abs_std = fabs(std_residual);
+    if (abs_std <= k0) {
+        return init_weight;
+    }
+    else if (abs_std <= k1) {
+        double ratio = (k1 - abs_std) / (k1 - k0);
+        return init_weight * ratio * ratio;  // å¹³æ–¹è¡°å‡
+    }
+    else {
+        return 0.01 * init_weight;  // ä¿ç•™1%
+    }
+}
+
 void CRadCaliDlg::Process()
 {
     gs_hWnd = m_hWnd;
@@ -784,256 +872,344 @@ void CRadCaliDlg::Process()
     if (m_bAdj) {
         print2Log("RadBA start...\n");
 
-        double* pAK1 = new double[sum * 2];
-        double* pAK2 = pAK1 + sum;
-        memset(pAK1, 0, sizeof(double) * sum * 2);
-        for (i = 0; i < sum; i++) {
-            m_listCtrl.GetItemText(i, 0, str, 256);
-            sprintf(strT, "%s%s.tsk_skm.txt", strRom, strrchr(str, '\\'));
-            FILE* fKM = fopen(strT, "rt");
-            fscanf(fKM, "%lf%lf", pAK1 + i, pAK2 + i);   print2Log("%lf %lf\n", pAK1[i], pAK2[i]);
-            fclose(fKM);
-        }
+        //double* pAK1 = new double[sum * 2];
+        //double* pAK2 = pAK1 + sum;
+        //memset(pAK1, 0, sizeof(double) * sum * 2);
+        //for (i = 0; i < sum; i++) {
+        //    m_listCtrl.GetItemText(i, 0, str, 256);
+        //    sprintf(strT, "%s%s.tsk_skm.txt", strRom, strrchr(str, '\\'));
+        //    FILE* fKM = fopen(strT, "rt");
+        //    fscanf(fKM, "%lf%lf", pAK1 + i, pAK2 + i);   print2Log("%lf %lf\n", pAK1[i], pAK2[i]);
+        //    fclose(fKM);
+        //}
 
-        double* aa = new double[(sum * 4) * (sum * 4)];
-        double* b = new double[(sum * 4)];
-        double* a = new double[(sum * 4)];
-        double* x = new double[(sum * 4)];
-        double* xPrev = new double[(sum * 4)];
+        int n = sum * 4;
+        print2Log("System size: %d unknowns\n", n);
 
-        // ÎÈ½¡IRLS²ÎÊı
-        const int ROBUST_MAX_ITERS = 1;     // ÎÈ½¡µü´ú×î¶àÂÖ´Î£¨ÇáÁ¿£©
-        const double HUBER_C = 1.345;       // Huber³£Êı£¨µ¥Î»Îªsigma±¶Êı£©
-        auto huberW = [](double r, double k) -> double {
-            double ar = fabs(r);
-            if (k <= 1e-12) return 1.0;
-            return (ar <= k) ? 1.0 : (k / ar);
-            };
+        double* aa = new double[n * n];
+        double* b = new double[n];
+        double* x = new double[n];
 
         ProgBegin(sum * 4);
+
         for (c = 0; c < 4; c++) {
-            UINT st = GetTickCount(); print2Log("proc band %d , Norml ... st= %d\n", c + 1, st);
+            UINT st = GetTickCount();
+            print2Log("\n========== Band %d ==========\n", c + 1);
 
-            // ³õÊ¼·¨·½³Ì£¨±£³ÖÔ­»ùÏßÈ¨£©
-            memset(aa, 0, sizeof(double) * (sum * 4) * (sum * 4));
-            memset(b, 0, sizeof(double) * (sum * 4));
-            for (i = 0; i < sum; i++, ProgStep(cancel)) {
-                if (::WaitForSingleObject(m_hEThEHdl, 1) == WAIT_OBJECT_0) break;
+            // ç¬¬ä¸€æ­¥ï¼šæ”¶é›†æ‰€æœ‰è§‚æµ‹å€¼
+            print2Log("Step 1: Collecting observations...\n");
+            std::vector<Observation> observations;
+            observations.reserve(10000000);  // é¢„åˆ†é…
 
-                m_listCtrl.GetItemText(i, 0, str, 256);  print2Log("process[%d @ %d]: %s ", i + 1, sum, strrchr(str, '\\')); UINT ss = GetTickCount();
+            for (i = 0; i < sum; i++) {
+                char str[512], strT[256], strSrc[256], strRef[256], strOlp[512];
+                int idx, idxr;
+
+                m_listCtrl.GetItemText(i, 0, str, 256);
                 sprintf(strT, "%s%s.tsk", strRom, strrchr(str, '\\'));
 
-                FILE* fTsk = fopen(strT, "rt"); if (!fTsk) continue;
-                fgets(str, 512, fTsk); sscanf(str, "%s", strSrc); DOS_PATH(strSrc);
-                fgets(str, 512, fTsk); sscanf(str, "%d", &idx);
+                FILE* fTsk = fopen(strT, "rt");
+                if (!fTsk) continue;
+
+                fgets(str, 512, fTsk);
+                sscanf(str, "%s", strSrc);
+                DOS_PATH(strSrc);
+
+                fgets(str, 512, fTsk);
+                sscanf(str, "%d", &idx);
+
                 while (!feof(fTsk)) {
                     if (!fgets(str, 512, fTsk)) break;
-                    sscanf(str, "%s", strRef); DOS_PATH(strRef);
+                    sscanf(str, "%s", strRef);
+                    DOS_PATH(strRef);
+
                     if (!fgets(str, 512, fTsk)) break;
                     sscanf(str, "%d", &idxr);
-                    strcpy(strOlp, strT);  strcpy(strrchr(strOlp, '.'), "_"); strcat(strOlp, strrchr(strRef, '\\') + 1); strcat(strOlp, ".olp");
+
+                    strcpy(strOlp, strT);
+                    strcpy(strrchr(strOlp, '.'), "_");
+                    strcat(strOlp, strrchr(strRef, '\\') + 1);
+                    strcat(strOlp, ".olp");
+
+                    COlpFile olpF;
                     if (olpF.Load4File(strOlp)) {
-                        double k1, k2, k1r, k2r, l;
-                        int v, oz; OBV* pOs = olpF.GetData(&oz); cprintf("%s tieSum= %d\n", strOlp, oz);
-                        if (idxr == -1) {
-                            for (v = 0; v < oz; v++, pOs++) {
-                                k1 = getKval(1, pOs->csz, pOs->cvz, pOs->cas) - pAK1[idx];
-                                k2 = getKval(4, pOs->csz, pOs->cvz, pOs->cas) - pAK2[idx];
-                                memset(a, 0, sizeof(double) * (sum * 4));
-                                l = (pOs->rv[c]);
-                                a[idx * 4 + 0] = -1;
-                                a[idx * 4 + 1] = -k1;
-                                a[idx * 4 + 2] = -k2;
-                                a[idx * 4 + 3] = pOs->cv[c];
-                                Nrml(a, (sum * 4), l, aa, b, 1.0);
+                        int oz;
+                        OBV* pOs = olpF.GetData(&oz);
+
+                        for (int v = 0; v < oz; v++, pOs++) {
+                            Observation obs;
+                            obs.idx = idx;
+                            obs.idxr = idxr;
+                            obs.band = c;
+
+                            obs.k1 = getKval(1, pOs->csz, pOs->cvz, pOs->cas);
+                            obs.k2 = getKval(4, pOs->csz, pOs->cvz, pOs->cas);
+                            obs.cv = pOs->cv[c];
+                            obs.rv = pOs->rv[c];
+
+                            if (idxr == -1) {
+                                obs.init_weight = 1.0;
+                                obs.k1r = 0;
+                                obs.k2r = 0;
                             }
-                        }
-                        else {
-                            for (v = 0; v < oz; v++, pOs++) {
-                                k1 = getKval(1, pOs->csz, pOs->cvz, pOs->cas) - pAK1[idx];
-                                k2 = getKval(4, pOs->csz, pOs->cvz, pOs->cas) - pAK2[idx];
-                                k1r = getKval(1, pOs->rsz, pOs->rvz, pOs->ras) - pAK1[idxr];
-                                k2r = getKval(4, pOs->rsz, pOs->rvz, pOs->ras) - pAK2[idxr];
-                                memset(a, 0, sizeof(double) * (sum * 4));
-                                l = pOs->cv[c] - pOs->rv[c];
-                                a[idx * 4 + 0] = 1;  a[idx * 4 + 1] = k1;  a[idx * 4 + 2] = k2;
-                                a[idxr * 4 + 0] = -1; a[idxr * 4 + 1] = -k1r; a[idxr * 4 + 2] = -k2r;
-                                Nrml(a, (sum * 4), l, aa, b, 0.1);
+                            else {
+                                obs.init_weight = 0.1;
+                                obs.k1r = getKval(1, pOs->rsz, pOs->rvz, pOs->ras);
+                                obs.k2r = getKval(4, pOs->rsz, pOs->rvz, pOs->ras);
                             }
+
+                            obs.weight = obs.init_weight;
+                            obs.residual = 0;
+
+                            observations.push_back(obs);
                         }
                     }
                 }
                 fclose(fTsk);
-                print2Log(", used tm= %.2lf sec \n", (GetTickCount() - ss) * 0.001);
             }
-            print2Log("Norml ...over. tm= %.2lf sec \nSolve ... st= %d \n", (GetTickCount() - st) * 0.001, GetTickCount());
 
-            // ³õ½â
-            memset(x, 0, sizeof(double) * (sum * 4));
-            Solve(aa, b, x, (sum * 4), (sum * 4));
-            memcpy(xPrev, x, sizeof(double) * (sum * 4));
-            double sigmaForK_prev = 0.0;
-            // ÎÈ½¡IRLS
-            for (int it = 0; it < ROBUST_MAX_ITERS; ++it) {
-                UINT stRes = GetTickCount();
-                // 1) ¼ÆËã²Ğ²îRMS£¨½üËÆsigma£©
-                double sumr2 = 0.0; INT64 nobs = 0;
+            print2Log("Total observations: %d\n", observations.size());
 
-                for (i = 0; i < sum; i++) {
-                    m_listCtrl.GetItemText(i, 0, str, 256);
-                    sprintf(strT, "%s%s.tsk", strRom, strrchr(str, '\\'));
-                    FILE* fTsk = fopen(strT, "rt"); if (!fTsk) continue;
-                    fgets(str, 512, fTsk); sscanf(str, "%s", strSrc); DOS_PATH(strSrc);
-                    fgets(str, 512, fTsk); sscanf(str, "%d", &idx);
+            // ç¬¬äºŒæ­¥ï¼šè¿­ä»£å¹³å·®
+            int max_iterations = 10;
+            double sigma0 = 1.0;
+            memset(x, 0, sizeof(double) * n);
 
-                    while (!feof(fTsk)) {
-                        if (!fgets(str, 512, fTsk)) break;
-                        sscanf(str, "%s", strRef); DOS_PATH(strRef);
-                        if (!fgets(str, 512, fTsk)) break;
-                        sscanf(str, "%d", &idxr);
-                        strcpy(strOlp, strT);  strcpy(strrchr(strOlp, '.'), "_"); strcat(strOlp, strrchr(strRef, '\\') + 1); strcat(strOlp, ".olp");
-                        if (!olpF.Load4File(strOlp)) continue;
+            for (int iter = 0; iter < max_iterations; iter++) {
+                print2Log("\n--- Iteration %d ---\n", iter + 1);
+                UINT iter_st = GetTickCount();
 
-                        int oz = 0; OBV* pOs = olpF.GetData(&oz);
-                        for (int v = 0; v < oz; ++v, ++pOs) {
-                            double k1, k2, k1r = 0, k2r = 0, l;
-                            if (idxr == -1) {
-                                k1 = getKval(1, pOs->csz, pOs->cvz, pOs->cas) - pAK1[idx];
-                                k2 = getKval(4, pOs->csz, pOs->cvz, pOs->cas) - pAK2[idx];
-                                l = pOs->rv[c];
-                                // dot = a*x
-                                double dot = (-1.0) * x[idx * 4 + 0]
-                                    + (-k1) * x[idx * 4 + 1]
-                                    + (-k2) * x[idx * 4 + 2]
-                                    + (double)pOs->cv[c] * x[idx * 4 + 3];
-                                double r = l - dot;
-                                sumr2 += r * r; nobs++;
-                            }
-                            else {
-                                k1 = getKval(1, pOs->csz, pOs->cvz, pOs->cas) - pAK1[idx];
-                                k2 = getKval(4, pOs->csz, pOs->cvz, pOs->cas) - pAK2[idx];
-                                k1r = getKval(1, pOs->rsz, pOs->rvz, pOs->ras) - pAK1[idxr];
-                                k2r = getKval(4, pOs->rsz, pOs->rvz, pOs->ras) - pAK2[idxr];
-                                l = pOs->cv[c] - pOs->rv[c];
-                                double dot =
-                                    (1.0) * x[idx * 4 + 0] + (k1)*x[idx * 4 + 1] + (k2)*x[idx * 4 + 2]
-                                    + (-1.0) * x[idxr * 4 + 0] + (-k1r) * x[idxr * 4 + 1] + (-k2r) * x[idxr * 4 + 2];
-                                double r = l - dot;
-                                sumr2 += r * r; nobs++;
-                            }
-                        }
-                    }
-                    fclose(fTsk);
-                }
-                double dof = (double)std::max<INT64>(1, nobs - (INT64)sum * 4);
-                double sigmaRaw = std::sqrt(sumr2 / dof);
+                // æ„å»ºæ³•æ–¹ç¨‹ï¼ˆå¹¶è¡Œï¼‰
+                memset(aa, 0, sizeof(double) * n * n);
+                memset(b, 0, sizeof(double) * n);
 
-                // ÓÃÓÚÃÅÏŞµÄ³ß¶È£ºµ¥µ÷²»Éı£¬±ÜÃâãĞÖµ±ä¿í
-                double sigmaForK = (it == 0) ? sigmaRaw : std::min(sigmaForK_prev, sigmaRaw);
-                sigmaForK_prev = sigmaForK;
-                double kThr = HUBER_C * sigmaForK;
-                print2Log("band %d iter %d: nobs=%lld sigmaRaw=%.6f sigmaForK=%.6f (tm=%.2fs)\n",
-                    c + 1, it + 1, (long long)nobs, sigmaRaw, sigmaForK, (GetTickCount() - stRes) * 0.001);
+#pragma omp parallel
+                {
+                    double* local_aa = new double[n * n];
+                    double* local_b = new double[n];
+                    memset(local_aa, 0, sizeof(double) * n * n);
+                    memset(local_b, 0, sizeof(double) * n);
 
-                // 2) ÒÔHuberÈ¨ÖØÖØ½¨·¨·½³Ì
-                memset(aa, 0, sizeof(double) * (sum * 4) * (sum * 4));
-                memset(b, 0, sizeof(double) * (sum * 4));
-                double sumr2W = 0.0, sumW = 0.0;
-                for (i = 0; i < sum; i++) {
-                    m_listCtrl.GetItemText(i, 0, str, 256);
-                    sprintf(strT, "%s%s.tsk", strRom, strrchr(str, '\\'));
-                    FILE* fTsk = fopen(strT, "rt"); if (!fTsk) continue;
-                    fgets(str, 512, fTsk); sscanf(str, "%s", strSrc); DOS_PATH(strSrc);
-                    fgets(str, 512, fTsk); sscanf(str, "%d", &idx);
+#pragma omp for schedule(static)
+                    for (int obs_id = 0; obs_id < (int)observations.size(); obs_id++) {
+                        Observation& obs = observations[obs_id];
 
-                    while (!feof(fTsk)) {
-                        if (!fgets(str, 512, fTsk)) break;
-                        sscanf(str, "%s", strRef); DOS_PATH(strRef);
-                        if (!fgets(str, 512, fTsk)) break;
-                        sscanf(str, "%d", &idxr);
-                        strcpy(strOlp, strT);  strcpy(strrchr(strOlp, '.'), "_"); strcat(strOlp, strrchr(strRef, '\\') + 1); strcat(strOlp, ".olp");
-                        if (!olpF.Load4File(strOlp)) continue;
+                        if (obs.weight < 0.001) continue;
 
-                        int oz = 0; OBV* pOs = olpF.GetData(&oz);
-                        if (idxr == -1) {
-                            for (int v = 0; v < oz; ++v, ++pOs) {
-                                double k1 = getKval(1, pOs->csz, pOs->cvz, pOs->cas) - pAK1[idx];
-                                double k2 = getKval(4, pOs->csz, pOs->cvz, pOs->cas) - pAK2[idx];
-                                double l = (pOs->rv[c]);
-                                double dot = (-1.0) * x[idx * 4 + 0]
-                                    + (-k1) * x[idx * 4 + 1]
-                                    + (-k2) * x[idx * 4 + 2]
-                                    + (double)pOs->cv[c] * x[idx * 4 + 3];
-                                double r = l - dot;
-                                double w = 1.0 * huberW(r, kThr); // »ùÏßÈ¨(1.0) * ²Ğ²îÈ¨
+                        if (obs.idxr == -1) {
+                            // åŸºçº¿çº¦æŸ: -x0 - k1*x1 - k2*x2 + cv*x3 = rv
+                            double a[4] = { -1, -obs.k1, -obs.k2, obs.cv };
+                            double l = obs.rv;
 
-                                memset(a, 0, sizeof(double) * (sum * 4));
-                                a[idx * 4 + 0] = -1;
-                                a[idx * 4 + 1] = -k1;
-                                a[idx * 4 + 2] = -k2;
-                                a[idx * 4 + 3] = pOs->cv[c];
-                                Nrml(a, (sum * 4), l, aa, b, w);
+                            for (int ii = 0; ii < 4; ii++) {
+                                int row = obs.idx * 4 + ii;
+                                local_b[row] += obs.weight * a[ii] * l;
 
-                                sumr2W += w * r * r; sumW += w;
+                                for (int jj = 0; jj < 4; jj++) {
+                                    int col = obs.idx * 4 + jj;
+                                    local_aa[row * n + col] += obs.weight * a[ii] * a[jj];
+                                }
                             }
                         }
                         else {
-                            for (int v = 0; v < oz; ++v, ++pOs) {
-                                double k1 = getKval(1, pOs->csz, pOs->cvz, pOs->cas) - pAK1[idx];
-                                double k2 = getKval(4, pOs->csz, pOs->cvz, pOs->cas) - pAK2[idx];
-                                double k1r = getKval(1, pOs->rsz, pOs->rvz, pOs->ras) - pAK1[idxr];
-                                double k2r = getKval(4, pOs->rsz, pOs->rvz, pOs->ras) - pAK2[idxr];
-                                double l = pOs->cv[c] - pOs->rv[c];
-                                double dot =
-                                    (1.0) * x[idx * 4 + 0] + (k1)*x[idx * 4 + 1] + (k2)*x[idx * 4 + 2]
-                                    + (-1.0) * x[idxr * 4 + 0] + (-k1r) * x[idxr * 4 + 1] + (-k2r) * x[idxr * 4 + 2];
-                                double r = l - dot;
-                                double w = 0.1 * huberW(r, kThr); // »ùÏßÈ¨(0.05) * ²Ğ²îÈ¨
+                            // ç›¸å¯¹çº¦æŸ
+                            double l = obs.cv - obs.rv;
 
-                                memset(a, 0, sizeof(double) * (sum * 4));
-                                a[idx * 4 + 0] = 1;  a[idx * 4 + 1] = k1;  a[idx * 4 + 2] = k2;
-                                a[idxr * 4 + 0] = -1; a[idxr * 4 + 1] = -k1r; a[idxr * 4 + 2] = -k2r;
-                                Nrml(a, (sum * 4), l, aa, b, w);
+                            // idxéƒ¨åˆ†
+                            double a_idx[4] = { 1, obs.k1, obs.k2, 0 };
+                            for (int ii = 0; ii < 4; ii++) {
+                                int row = obs.idx * 4 + ii;
+                                local_b[row] += obs.weight * a_idx[ii] * l;
 
-                                sumr2W += w * r * r; sumW += w;
+                                for (int jj = 0; jj < 4; jj++) {
+                                    int col = obs.idx * 4 + jj;
+                                    local_aa[row * n + col] += obs.weight * a_idx[ii] * a_idx[jj];
+                                }
+                            }
+
+                            // idxréƒ¨åˆ†
+                            double a_idxr[4] = { -1, -obs.k1r, -obs.k2r, 0 };
+                            for (int ii = 0; ii < 4; ii++) {
+                                int row = obs.idxr * 4 + ii;
+                                local_b[row] += obs.weight * a_idxr[ii] * l;
+
+                                for (int jj = 0; jj < 4; jj++) {
+                                    int col = obs.idxr * 4 + jj;
+                                    local_aa[row * n + col] += obs.weight * a_idxr[ii] * a_idxr[jj];
+                                }
+                            }
+
+                            // äº¤å‰é¡¹
+                            for (int ii = 0; ii < 4; ii++) {
+                                for (int jj = 0; jj < 4; jj++) {
+                                    int row = obs.idx * 4 + ii;
+                                    int col = obs.idxr * 4 + jj;
+                                    local_aa[row * n + col] += obs.weight * a_idx[ii] * a_idxr[jj];
+
+                                    row = obs.idxr * 4 + ii;
+                                    col = obs.idx * 4 + jj;
+                                    local_aa[row * n + col] += obs.weight * a_idxr[ii] * a_idx[jj];
+                                }
                             }
                         }
                     }
-                    fclose(fTsk);
+
+#pragma omp critical(merge_equations)
+                    {
+                        for (int ii = 0; ii < n; ii++) {
+                            b[ii] += local_b[ii];
+                            for (int jj = 0; jj < n; jj++) {
+                                aa[ii * n + jj] += local_aa[ii * n + jj];
+                            }
+                        }
+                    }
+
+                    delete[] local_aa;
+                    delete[] local_b;
                 }
 
-                // 3) ÖØĞÂÇó½â²¢¼ì²éÊÕÁ²
-                Solve(aa, b, x, (sum * 4), (sum * 4));
-                double dofW = std::max(1.0, sumW - (double)sum * 4);
-                double sigmaW = std::sqrt(std::max(0.0, sumr2W / dofW));
-                print2Log("band %d iter %d solved. sigmaW=%.6f (weighted), sumW=%.3f, dofW=%.0f\n",
-                    c + 1, it + 1, sigmaW, sumW, dofW);
+                print2Log("Equations built, ");
 
-                double maxDiff = 0.0;
-                for (int q = 0; q < sum * 4; ++q) {
-                    maxDiff = std::max(maxDiff, std::fabs(x[q] - xPrev[q]));
+                // æ£€æŸ¥å¹¶æ·»åŠ æ­£åˆ™åŒ–
+                double diag_min = 1e100, diag_max = -1e100;
+                for (int ii = 0; ii < n; ii++) {
+                    double diag = aa[ii * n + ii];
+                    if (diag > 1e-15) {
+                        if (diag < diag_min) diag_min = diag;
+                        if (diag > diag_max) diag_max = diag;
+                    }
                 }
-                print2Log("band %d iter %d solved. max |dx| = %.3e\n", c + 1, it + 1, maxDiff);
-                memcpy(xPrev, x, sizeof(double) * (sum * 4));
-                if (maxDiff < 1e-6) { print2Log("band %d converged at iter %d\n", c + 1, it + 1); break; }
-            } // end IRLS
 
-            // Êä³ö×îÖÕ½â
+                double regularization = diag_max * 1e-8;
+                for (int ii = 0; ii < n; ii++) {
+                    aa[ii * n + ii] += regularization;
+                }
+
+                // æ±‚è§£
+                bool success = CholeskySolve(aa, b, x, n);
+                if (!success) {
+                    print2Log("Solve failed, retrying with stronger regularization...\n");
+                    for (int ii = 0; ii < n; ii++) {
+                        aa[ii * n + ii] += diag_max * 1e-6;
+                    }
+                    success = CholeskySolve(aa, b, x, n);
+                    if (!success) {
+                        print2Log("ERROR: Cannot solve!\n");
+                        break;
+                    }
+                }
+
+                print2Log("Solved, ");
+
+                // è®¡ç®—æ®‹å·®å’Œsigma0
+                double vv_sum = 0;
+                int valid_count = 0;
+                std::vector<double> abs_residuals;
+                abs_residuals.reserve(observations.size());
+
+#pragma omp parallel for reduction(+:vv_sum,valid_count)
+                for (int obs_id = 0; obs_id < (int)observations.size(); obs_id++) {
+                    Observation& obs = observations[obs_id];
+
+                    if (obs.weight < 0.001) continue;
+
+                    double computed;
+                    if (obs.idxr == -1) {
+                        computed = -x[obs.idx * 4 + 0]
+                            - obs.k1 * x[obs.idx * 4 + 1]
+                            - obs.k2 * x[obs.idx * 4 + 2]
+                            + obs.cv * x[obs.idx * 4 + 3];
+                        obs.residual = computed - obs.rv;
+                    }
+                    else {
+                        computed = (x[obs.idx * 4 + 0] + obs.k1 * x[obs.idx * 4 + 1]
+                            + obs.k2 * x[obs.idx * 4 + 2] - obs.cv)
+                            - (x[obs.idxr * 4 + 0] + obs.k1r * x[obs.idxr * 4 + 1]
+                                + obs.k2r * x[obs.idxr * 4 + 2] - obs.rv);
+                        obs.residual = computed;
+                    }
+
+                    vv_sum += obs.residual * obs.residual * obs.weight;
+                    valid_count++;
+
+#pragma omp critical(push_residual)
+                    {
+                        abs_residuals.push_back(fabs(obs.residual));
+                    }
+                }
+
+                // ä½¿ç”¨MADè®¡ç®—sigma0ï¼ˆæ›´ç¨³å¥ï¼‰
+                std::sort(abs_residuals.begin(), abs_residuals.end());
+                sigma0 = abs_residuals[abs_residuals.size() / 2] * 1.4826;
+                double rmse = sqrt(vv_sum / valid_count);
+
+                print2Log("sigma0=%.4f, RMSE=%.4f, ", sigma0, rmse);
+
+                // æœ€åä¸€æ¬¡è¿­ä»£ä¸æ›´æ–°æƒé‡
+                if (iter == max_iterations - 1) {
+                    print2Log("Done\n");
+                    break;
+                }
+
+                // æ›´æ–°æƒé‡ï¼ˆIGG3ï¼‰
+                int outlier_count = 0;
+
+#pragma omp parallel for reduction(+:outlier_count)
+                for (int obs_id = 0; obs_id < (int)observations.size(); obs_id++) {
+                    Observation& obs = observations[obs_id];
+
+                    double std_residual = obs.residual / (sigma0 + 1e-10);
+                    double new_weight = IGG3Weight(std_residual, obs.init_weight);
+
+                    if (new_weight < obs.weight * 0.8) {
+                        outlier_count++;
+                    }
+
+                    obs.weight = new_weight;
+                }
+
+                print2Log("Outliers=%d(%.1f%%), %.2fs\n",
+                    outlier_count, 100.0 * outlier_count / observations.size(),
+                    (GetTickCount() - iter_st) * 0.001);
+
+                ProgStep(cancel);
+            }
+
+            // æ£€æŸ¥è§£çš„è´¨é‡
+            double x_min = 1e100, x_max = -1e100;
+            int nan_count = 0;
+
+            for (int ii = 0; ii < n; ii++) {
+                if (!isfinite(x[ii])) {
+                    nan_count++;
+                }
+                else {
+                    if (x[ii] < x_min) x_min = x[ii];
+                    if (x[ii] > x_max) x_max = x[ii];
+                }
+            }
+
+            print2Log("Solution: [%.4f, %.4f], ", x_min, x_max);
+            print2Log("Status: %s\n", nan_count == 0 ? "Good" : "Fail");
+
+            // è¾“å‡ºç»“æœ
             sprintf(str, "%s//pre_bnd%d.txt", strRom, c + 1);
             FILE* fKnl = fopen(str, "wt");
             for (i = 0; i < sum; i++) {
                 m_listCtrl.GetItemText(i, 0, str, 256);
                 fprintf(fKnl, "%9.6lf \t %15.6lf \t %15.6lf \t %15.6lf \t %s\n",
-                    x[i * 4 + 3], x[i * 4 + 0], x[i * 4 + 1], x[i * 4 + 2], strrchr(str, '\\'));
+                    x[i * 4 + 3], x[i * 4 + 0], x[i * 4 + 1], x[i * 4 + 2],
+                    strrchr(str, '\\'));
             }
             fclose(fKnl);
+
+            print2Log("Band %d done. Total: %.2fs\n\n",
+                c + 1, (GetTickCount() - st) * 0.001);
         }
-        delete[]pAK1;
-        delete[]aa;
-        delete[]a;
-        delete[]b;
-        delete[]x;
-        delete[]xPrev;
+
+        delete[] aa;
+        delete[] b;
+        delete[] x;
 
         ProgEnd();
         print2Log("RadBA over.\n");
@@ -1104,27 +1280,42 @@ inline WORD* GetBiPxlRS(float fx, float fy, int cols, int rows, int bnds,WORD *p
     return buf;
 }
 
+inline WORD* GetAvPxlRS(float fx, float fy, int cols, int rows, int bnds, WORD* pBuf, int avz, WORD bkGrd = 0) {
+    WORD* buf, buf00[16] = { bkGrd,bkGrd,bkGrd,bkGrd,bkGrd,bkGrd,bkGrd,bkGrd };
+    static WORD buf0[16]; memcpy(buf0, buf00, sizeof(buf0)); buf = buf0;
+    int col = int(fx), row = int(fy), az = avz / 2;
+    if (col < az || row < az || col >= cols - 1 - az || row >= rows - 1 - az) return buf;
 
-inline WORD* GetAvPxlRS(float fx, float fy, int cols, int rows, int bnds,WORD *pBuf, int avz,WORD bkGrd = 0){    
-    WORD *buf,buf00[16]={bkGrd,bkGrd,bkGrd,bkGrd,bkGrd,bkGrd,bkGrd,bkGrd};
-    static WORD buf0[16]; memcpy(buf0,buf00,sizeof(buf0)); buf= buf0;
-    int col = int(fx), row = int(fy),az=avz/2; 
-    if (col < az || row < az || col >= cols-1-az || row >= rows-1-az )  return buf;
-    int r,c,b,bs,s=0,sv[16]={0,0,0,0,0,0,0,}; WORD *p, *p0;
-    for( r=0;r<avz;r++ ){
-        p0 = pBuf+(INT64(row-az+r)*cols + col-az)*bnds;
-        for( p=p0,c=0;c<avz;c++ ){
-            for( bs=0,b=0;b<bnds;b++,p++ ){
-                sv[b]+=p[b]; if (p[b]) bs++;
+    int r, c, b;
+    INT64 sv[16] = { 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0 };  // æ”¹ç”¨INT64é¿å…æº¢å‡º
+    int sCount[16] = { 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0 };  // æ¯ä¸ªæ³¢æ®µå•ç‹¬è®¡æ•°
+    WORD* p, * p0;
+
+    for (r = 0; r < avz; r++) {
+        p0 = pBuf + (INT64(row - az + r) * cols + col - az) * bnds;
+        for (c = 0; c < avz; c++, p0 += bnds) {
+            for (b = 0; b < bnds; b++) {
+                WORD val = p0[b];
+                if (val > 0) {  // åªç´¯åŠ æœ‰æ•ˆå€¼
+                    sv[b] += val;
+                    sCount[b]++;
+                }
             }
-            if (bs) s++;
         }
     }
-    if (s>az){ for( b=0;b<bnds;b++){ buf[b] = sv[b]/s; } }
+
+    for (b = 0; b < bnds; b++) {
+        if (sCount[b] > 0) {
+            buf[b] = (WORD)(sv[b] / sCount[b]);
+        }
+        else {
+            buf[b] = 0;
+        }
+    }
     return buf;
 }
 
-static bool GetPxl(double gx,double gy,CWuErsImage *pImg,short *pv,int gs,double *fc0=NULL,double *fr0=NULL){
+static bool GetPxl(double gx,double gy,CWuErsImage *pImg,WORD *pv,int gs,double *fc0=NULL,double *fr0=NULL){
 
     int cols = pImg->GetCols();
     int rows = pImg->GetRows();
@@ -1141,14 +1332,14 @@ static bool GetPxl(double gx,double gy,CWuErsImage *pImg,short *pv,int gs,double
     return true;
 }
 
-// ´Ó16Î»¶à¹âÆ×È¡»Ò¶È£¨Ç°3²¨¶Î¾ùÖµ£©
+// ä»16ä½å¤šå…‰è°±å–ç°åº¦ï¼ˆå‰3æ³¢æ®µå‡å€¼ï¼‰
 static inline double GrayFromWordBands(const WORD* px) {
     int valid = 0; int sum = 0;
     for (int b = 0; b < 3; ++b) { if (px[b] > 0) { sum += (int)px[b]; valid++; } }
     return valid ? double(sum) / valid : 0.0;
 }
 
-// ¼ÆËãZNCC
+// è®¡ç®—ZNCC
 static inline double ZNCC(const std::vector<double>& A, double meanA, double stdA,
     const std::vector<double>& B, double meanB, double stdB)
 {
@@ -1158,7 +1349,7 @@ static inline double ZNCC(const std::vector<double>& A, double meanA, double std
     return s / (double(A.size()) * stdA * stdB);
 }
 
-// ÑéÖ¤¼¸ºÎÎ»ÖÃ¶ÔÓ¦µÄ ZNCC£¨»ù×¼Ó°Ïñ¿éÖĞĞÄ(cxBase,cyBase)£¬°ë¾¶rad£¬ZNCCãĞÖµznccThr£©
+// éªŒè¯å‡ ä½•ä½ç½®å¯¹åº”çš„ ZNCCï¼ˆåŸºå‡†å½±åƒå—ä¸­å¿ƒ(cxBase,cyBase)ï¼ŒåŠå¾„radï¼ŒZNCCé˜ˆå€¼znccThrï¼‰
 static bool VerifyByZNCC(CWuErsImage& baseImg, CWuErsImage& hrImg,
     int cxBase, int cyBase, int rad, double znccThr)
 {
@@ -1192,7 +1383,7 @@ static bool VerifyByZNCC(CWuErsImage& baseImg, CWuErsImage& hrImg,
             double gx = baseImg.m_tlX + xB * baseImg.m_dx;
             double gy = baseImg.m_tlY - (rowsB - 1 - yB) * baseImg.m_dy;
 
-            short pv[4] = { 0,0,0,0 }; double fcx, fcy;
+            WORD pv[4] = { 0,0,0,0 }; double fcx, fcy;
             GetPxl(gx, gy, &hrImg, pv, avz, &fcx, &fcy);
             double gH = GrayFromWordBands((const WORD*)pv);
             hrPatch.push_back(gH);
@@ -1216,23 +1407,25 @@ static bool VerifyByZNCC(CWuErsImage& baseImg, CWuErsImage& hrImg,
     double zn = ZNCC(basePatch, mB, sBstd, hrPatch, mH, sHstd);
     return zn >= znccThr;
 }
-// ¼ÆËã½« img ¶ÔÆëµ½ coarse µÄ¿éÆ½¾ù´°¿Ú£¨>=2 Ôò·µ»Ø´°¿Ú³ß´ç£¬·ñÔò·µ»Ø 0 ±íÊ¾µ¥ÏñÔª/Ë«ÏßĞÔ£©
+// è®¡ç®—å°† img å¯¹é½åˆ° coarse çš„å—å¹³å‡çª—å£ï¼ˆ>=2 åˆ™è¿”å›çª—å£å°ºå¯¸ï¼Œå¦åˆ™è¿”å› 0 è¡¨ç¤ºå•åƒå…ƒ/åŒçº¿æ€§ï¼‰
 static inline int CalcAvzToCoarse(const CWuErsImage& coarse, const CWuErsImage& img) {
     double rx = std::abs(coarse.m_dx / img.m_dx);
     double ry = std::abs(coarse.m_dy / img.m_dy);
     if (!std::isfinite(rx) || rx <= 0) rx = 1.0;
     if (!std::isfinite(ry) || ry <= 0) ry = 1.0;
-    int avz = (int)std::round(0.5 * (rx + ry));
-    return (avz >= 2) ? avz : 0;
+    int avz = (int)std::round(std::max(rx, ry));
+    if (avz % 2 == 0) avz++;
+
+    return (avz >= 3) ? avz : 0;
 }
 
-// ²¢ĞĞÊÕ¼¯½á¹ûµÄ¼ÇÂ¼
+// å¹¶è¡Œæ”¶é›†ç»“æœçš„è®°å½•
 struct RadZNCCRec {
-    int cxDom, cyDom;     // Ö÷Ó°ÏñÏñËØ£¨¶¥->ÏÂ£©
-    int cxRef, cyRef;     // ²Î¿¼Ó°ÏñÏñËØ£¨¶¥->ÏÂ£©
-    short cv[4], rv[4];   // Ö÷/²Î¿¼ 4²¨¶Î
-    double sz, vz, as;    // Ö÷Ó°ÏñÌ«Ñô²ÎÊı
-    double sz1, vz1, as1; // ²Î¿¼Ó°ÏñÌ«Ñô²ÎÊı
+    int cxDom, cyDom;     // ä¸»å½±åƒåƒç´ ï¼ˆé¡¶->ä¸‹ï¼‰
+    int cxRef, cyRef;     // å‚è€ƒå½±åƒåƒç´ ï¼ˆé¡¶->ä¸‹ï¼‰
+    WORD cv[4], rv[4];   // ä¸»/å‚è€ƒ 4æ³¢æ®µ
+    double sz, vz, as;    // ä¸»å½±åƒå¤ªé˜³å‚æ•°
+    double sz1, vz1, as1; // å‚è€ƒå½±åƒå¤ªé˜³å‚æ•°
 };
 //////////////////////////////////////////////////////////////////////////////////
 static void WuErsToGray8(CWuErsImage& img, cv::Mat& outGray)
@@ -1254,12 +1447,12 @@ static void WuErsToGray8(CWuErsImage& img, cv::Mat& outGray)
             if (valid == 0) { gPtr[c] = 0; }
             else {
                 WORD v = (WORD)(s / valid);
-                gPtr[c] = (uint8_t)(v >> 8); // 16¡ú8
+                gPtr[c] = (uint8_t)(v >> 8); // 16â†’8
             }
         }
     }
 }
-// ´Ó .olp »æÖÆÆ¥ÅäÁ¬ÏßÍ¼£¨.png£©
+// ä» .olp ç»˜åˆ¶åŒ¹é…è¿çº¿å›¾ï¼ˆ.pngï¼‰
 static void SaveMatchesPlotFromOlp(CWuErsImage& domImg,
     CWuErsImage& refImg,
     COlpFile& olp,
@@ -1272,7 +1465,7 @@ static void SaveMatchesPlotFromOlp(CWuErsImage& domImg,
     WuErsToGray8(domImg, gL0);
     WuErsToGray8(refImg, gR0);
 
-    // »ùÓÚÏñÔª´óĞ¡×öÏÔÊ¾³ß¶È¹éÒ»£ºÍ³Ò»µ½½Ï´Ö·Ö±æÂÊ
+    // åŸºäºåƒå…ƒå¤§å°åšæ˜¾ç¤ºå°ºåº¦å½’ä¸€ï¼šç»Ÿä¸€åˆ°è¾ƒç²—åˆ†è¾¨ç‡
     const double gsdL = std::abs(domImg.m_dx);
     const double gsdR = std::abs(refImg.m_dx);
     const double gsdCoarse = std::max(gsdL, gsdR);
@@ -1293,7 +1486,7 @@ static void SaveMatchesPlotFromOlp(CWuErsImage& domImg,
     cv::cvtColor(gL, roiL, cv::COLOR_GRAY2BGR);
     cv::cvtColor(gR, roiR, cv::COLOR_GRAY2BGR);
 
-    // ¼ÆËãÃ¿¸öµã¾ØĞÎ¿òµÄ°ë¿í£¨»­²¼×ø±ê£¬ÒÑ¿¼ÂÇËõ·Å£©
+    // è®¡ç®—æ¯ä¸ªç‚¹çŸ©å½¢æ¡†çš„åŠå®½ï¼ˆç”»å¸ƒåæ ‡ï¼Œå·²è€ƒè™‘ç¼©æ”¾ï¼‰
     int halfBoxL = 6;
     int halfBoxR = 6;
     double minXL = 1e30, minYL = 1e30, maxXL = -1e30, maxYL = -1e30;
@@ -1320,7 +1513,7 @@ static void SaveMatchesPlotFromOlp(CWuErsImage& domImg,
                 maxYR = std::max(maxYR, rR_top);
             }
         }
-        // »­È«¾Ö°üÎ§ºĞ£¨×óÓÒÍ¼·Ö±ğ£©
+        // ç”»å…¨å±€åŒ…å›´ç›’ï¼ˆå·¦å³å›¾åˆ†åˆ«ï¼‰
         if (minXL < maxXL && minYL < maxYL) {
             cv::Rect rL((int)std::floor(std::max(0.0, minXL - halfBoxL)),
                 (int)std::floor(std::max(0.0, minYL - halfBoxL)),
@@ -1338,10 +1531,10 @@ static void SaveMatchesPlotFromOlp(CWuErsImage& domImg,
             cv::rectangle(canvas, rR, cv::Scalar(255, 0, 0), 2, cv::LINE_AA);
         }
     }
-    // Öğµã»æÖÆ
+    // é€ç‚¹ç»˜åˆ¶
     cv::RNG rng(12345);
     const OBV* p = pData;
-    for (int i = 0; i < oz; i += 10, p += 10) { // ÈÔ¾É³éÑù»æÖÆ£¬±ÜÃâ¹ıÃÜ
+    for (int i = 0; i < oz; i += 10, p += 10) { // ä»æ—§æŠ½æ ·ç»˜åˆ¶ï¼Œé¿å…è¿‡å¯†
         double rL_top = (gL0.rows - 1 - p->cr) * sL;
         double rR_top = (gR0.rows - 1 - p->rr) * sR;
         double cL_s = p->cc * sL;
@@ -1382,7 +1575,7 @@ BOOL MchTie(LPCSTR lpstrPar)
     int rows = domImg.GetRows();
     int bnds = domImg.GetBands();
     int pxSz = domImg.PxByte(domImg.GetPxType()) * bnds;
-    double gx, gy, gz, lon, lat, hei; short cv[4], rv[4];
+    double gx, gy, gz, lon, lat, hei; WORD cv[4], rv[4];
     double avK1 = 0, avK2 = 0, ks = 0; int r, c, rowsr; CWuGeoCvt geoCvt;
     geoCvt.Set_Cvt_Par(ET_WGS84, UTM_PROJECTION, SEMIMAJOR_WGS84, SEMIMINOR_WGS84, 0, Zone2CenterMerdian(utmZn) * SPGC_D2R, 500000, 0, 0.9996, 0);
 
@@ -1392,7 +1585,7 @@ BOOL MchTie(LPCSTR lpstrPar)
     if (fKM) {
         for (r = 1; r < rows - gs; r += gs) {
             for (c = 1; c < cols - gs; c += gs) {
-                short* pC = (short*)(domImg.m_pImgDat + (r * cols + c) * pxSz);
+                WORD* pC = (WORD*)(domImg.m_pImgDat + (r * cols + c) * pxSz);
                 if (pC[0] == 0 && pC[1] == 0 && pC[2] == 0) continue;
 
                 gx = domImg.m_tlX + c * domImg.m_dx;
@@ -1426,19 +1619,19 @@ BOOL MchTie(LPCSTR lpstrPar)
         char* pExtPng = strrchr(strPlot, '.'); if (pExtPng) strcpy(pExtPng, ".png"); else strcat(strPlot, ".png");
         int tieSum = 0, vSum = 0, cSum = 0;
 
-        // ÏÖÓĞ .olp
+        // ç°æœ‰ .olp
         if (/*IsExist(strOlp) && olpF.Load4File(strOlp)*/FALSE) {
             SaveMatchesPlotFromOlp(domImg, basImg, olpF, strPlot);
         }
         else {
-            // ÎŞ .olp£¬Ö´ĞĞÆ¥ÅäÉú³É
+            // æ—  .olpï¼Œæ‰§è¡ŒåŒ¹é…ç”Ÿæˆ
             olpF.SetSize(0); rowsr = basImg.GetRows();
 
 #ifdef USE_MY_MATCH
             const int rowsD = domImg.GetRows();
             const int colsD = domImg.GetCols();
 
-            // ×Ô¶¯Ñ¡Ôñ½Ï´ÖÓ°ÏñÎª»ù×¼³ß¶È£¨´ÖÓ°ÏñÖ±½ÓÈ¡ÏñÔª£¬Ï¸Ó°ÏñÓÃ¿éÆ½¾ù£©
+            // è‡ªåŠ¨é€‰æ‹©è¾ƒç²—å½±åƒä¸ºåŸºå‡†å°ºåº¦ï¼ˆç²—å½±åƒç›´æ¥å–åƒå…ƒï¼Œç»†å½±åƒç”¨å—å¹³å‡ï¼‰
             const double gsdDom = std::abs(domImg.m_dx);
             const double gsdRef = std::abs(basImg.m_dx);
             const bool domIsCoarse = (gsdDom > gsdRef);
@@ -1468,7 +1661,7 @@ BOOL MchTie(LPCSTR lpstrPar)
                         double gy_l = domImg.m_tlY - (rowsD - 1 - rr) * domImg.m_dy;
                         double gz_l = grdZ;
 
-                        short cv_l[4], rv_l[4];
+                        WORD cv_l[4], rv_l[4];
                         double fc_l, fr_l, fc1_l, fr1_l;
                         if (!GetPxl(gx_l, gy_l, &domImg, cv_l, avzDom, &fc_l, &fr_l)) continue;
                         if (cv_l[0] == 0 && cv_l[1] == 0 && cv_l[2] == 0) continue;
@@ -1478,7 +1671,7 @@ BOOL MchTie(LPCSTR lpstrPar)
                             cv_l[0] < 0 || cv_l[1] < 0 || cv_l[2] < 0 || cv_l[3] < 0) {
                             vLocal++; continue;
                         }
-                        // ZNCC ÑéÖ¤
+                        // ZNCC éªŒè¯
                         int verifyR = std::max(3, RAD_PATCH_RADIUS);
                         bool ok = false;
                         if (domIsCoarse) {
@@ -1493,7 +1686,7 @@ BOOL MchTie(LPCSTR lpstrPar)
                         }
                         if (!ok) { cLocal++; continue; }
 
-                        // Ì«Ñô²ÎÊı£¨Öğµã¶ÀÁ¢£©
+                        // å¤ªé˜³å‚æ•°ï¼ˆé€ç‚¹ç‹¬ç«‹ï¼‰
                         double lon_l, lat_l, hei_l, sz_l, vz_l, as_l, sz1_l = 0, vz1_l = 0, as1_l = 0;
                         geoCvt.Cvt_Prj2LBH(gx_l, gy_l, gz_l, &lon_l, &lat_l, &hei_l);
                         getSunPos(gx_l, gy_l, gz_l, cx, cy, cz,
@@ -1507,7 +1700,7 @@ BOOL MchTie(LPCSTR lpstrPar)
                                 &sz1_l, &vz1_l, &as1_l);
                         }
 
-                        // ÊÕ¼¯
+                        // æ”¶é›†
                         RadZNCCRec rec{};
                         rec.cxDom = (int)std::round(fc_l);
                         rec.cyDom = (int)std::round(fr_l);
@@ -1531,12 +1724,12 @@ BOOL MchTie(LPCSTR lpstrPar)
                 }
             } // end parallel
 
-            // Í³Ò»Êä³öµ½ .olp£¨.olp ĞĞºÅÎª¡°µ×->ÉÏ¡±£©
+            // ç»Ÿä¸€è¾“å‡ºåˆ° .olpï¼ˆ.olp è¡Œå·ä¸ºâ€œåº•->ä¸Šâ€ï¼‰
             for (const auto& rec : allRecs) {
                 olpF.Append(rec.sz, rec.vz, rec.as,
-                    rec.cxDom, int(rows - 1 - rec.cyDom), const_cast<short*>(rec.cv),
+                    rec.cxDom, int(rows - 1 - rec.cyDom), const_cast<WORD*>(rec.cv),
                     rec.sz1, rec.vz1, rec.as1,
-                    rec.cxRef, int(rowsr - 1 - rec.cyRef), const_cast<short*>(rec.rv));
+                    rec.cxRef, int(rowsr - 1 - rec.cyRef), const_cast<WORD*>(rec.rv));
             }
             tieSum += (int)allRecs.size();
             cprintf("tieSum=%d (threads=%d, gs=%d, verifyR=%d, thr=%.2f) skip(value<=0)=%d verifySkip=%d\n",
@@ -1550,7 +1743,7 @@ BOOL MchTie(LPCSTR lpstrPar)
 #else
             for (r = 1; r < rows - gs; r += gs) {
                 for (c = 1; c < cols - gs; c += gs) {
-                    short* pC = (short*)(domImg.m_pImgDat + (r * cols + c) * pxSz);
+                    WORD* pC = (WORD*)(domImg.m_pImgDat + (r * cols + c) * pxSz);
                     if (pC[0] == 0 && pC[1] == 0 && pC[2] == 0) continue;
 
                     gx = domImg.m_tlX + c * domImg.m_dx;
