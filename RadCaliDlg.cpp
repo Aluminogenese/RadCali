@@ -27,6 +27,14 @@
 
 #include <opencv2/opencv.hpp>
 #include <opencv2/features2d.hpp>
+#include <Eigen/Dense>
+#include <Eigen/Sparse>
+#include <vector>
+
+using Eigen::VectorXd;
+using Eigen::MatrixXd;
+//#define DN_SCALE 10000.0
+
 #pragma comment(lib,"opencv_imgproc490d.lib")
 #define USE_MY_MATCH
 #ifndef RAD_PATCH_RADIUS
@@ -872,23 +880,23 @@ void CRadCaliDlg::Process()
     if (m_bAdj) {
         print2Log("RadBA start...\n");
 
-        //double* pAK1 = new double[sum * 2];
-        //double* pAK2 = pAK1 + sum;
-        //memset(pAK1, 0, sizeof(double) * sum * 2);
-        //for (i = 0; i < sum; i++) {
-        //    m_listCtrl.GetItemText(i, 0, str, 256);
-        //    sprintf(strT, "%s%s.tsk_skm.txt", strRom, strrchr(str, '\\'));
-        //    FILE* fKM = fopen(strT, "rt");
-        //    fscanf(fKM, "%lf%lf", pAK1 + i, pAK2 + i);   print2Log("%lf %lf\n", pAK1[i], pAK2[i]);
-        //    fclose(fKM);
-        //}
+        double* pAK1 = new double[sum * 2];
+        double* pAK2 = pAK1 + sum;
+        memset(pAK1, 0, sizeof(double) * sum * 2);
+        for (i = 0; i < sum; i++) {
+            m_listCtrl.GetItemText(i, 0, str, 256);
+            sprintf(strT, "%s%s.tsk_skm.txt", strRom, strrchr(str, '\\'));
+            FILE* fKM = fopen(strT, "rt");
+            fscanf(fKM, "%lf%lf", pAK1 + i, pAK2 + i);   print2Log("%lf %lf\n", pAK1[i], pAK2[i]);
+            fclose(fKM);
+        }
 
         int n = sum * 4;
         print2Log("System size: %d unknowns\n", n);
 
-        double* aa = new double[n * n];
-        double* b = new double[n];
-        double* x = new double[n];
+        //double* aa = new double[n * n];
+        //double* b = new double[n];
+        //double* x = new double[n];
 
         ProgBegin(sum * 4);
 
@@ -896,10 +904,13 @@ void CRadCaliDlg::Process()
             UINT st = GetTickCount();
             print2Log("\n========== Band %d ==========\n", c + 1);
 
-            // 第一步：收集所有观测值
-            print2Log("Step 1: Collecting observations...\n");
-            std::vector<Observation> observations;
-            observations.reserve(10000000);  // 预分配
+            print2Log("Step 1: Counting observations...\n");
+
+            int total_obs = 0;
+            int baseline_obs = 0;  // 基线约束数量
+            int relative_obs = 0;  // 相对约束数量
+            int loaded_files = 0;
+            std::vector<int> obs_per_image(sum, 0);  // 每张影像的观测值数量
 
             for (i = 0; i < sum; i++) {
                 char str[512], strT[256], strSrc[256], strRef[256], strOlp[512];
@@ -934,285 +945,479 @@ void CRadCaliDlg::Process()
                     COlpFile olpF;
                     if (olpF.Load4File(strOlp)) {
                         int oz;
-                        OBV* pOs = olpF.GetData(&oz);
+                        olpF.GetData(&oz);
+                        total_obs += oz;
+                        obs_per_image[idx] += oz;
 
-                        for (int v = 0; v < oz; v++, pOs++) {
-                            Observation obs;
-                            obs.idx = idx;
-                            obs.idxr = idxr;
-                            obs.band = c;
-
-                            obs.k1 = getKval(1, pOs->csz, pOs->cvz, pOs->cas);
-                            obs.k2 = getKval(4, pOs->csz, pOs->cvz, pOs->cas);
-                            obs.cv = pOs->cv[c];
-                            obs.rv = pOs->rv[c];
-
-                            if (idxr == -1) {
-                                obs.init_weight = 1.0;
-                                obs.k1r = 0;
-                                obs.k2r = 0;
-                            }
-                            else {
-                                obs.init_weight = 0.1;
-                                obs.k1r = getKval(1, pOs->rsz, pOs->rvz, pOs->ras);
-                                obs.k2r = getKval(4, pOs->rsz, pOs->rvz, pOs->ras);
-                            }
-
-                            obs.weight = obs.init_weight;
-                            obs.residual = 0;
-
-                            observations.push_back(obs);
+                        if (idxr == -1) {
+                            baseline_obs += oz;
                         }
+                        else {
+                            relative_obs += oz;
+                            obs_per_image[idxr] += oz;
+                        }
+
+                        loaded_files++;
                     }
                 }
                 fclose(fTsk);
             }
 
-            print2Log("Total observations: %d\n", observations.size());
+            print2Log("Total observations: %d (from %d files)\n", total_obs, loaded_files);
+            print2Log("  Baseline constraints: %d\n", baseline_obs);
+            print2Log("  Relative constraints: %d\n", relative_obs);
 
-            // 第二步：迭代平差
-            int max_iterations = 10;
+            // 检查孤立影像
+            int isolated_images = 0;
+            for (i = 0; i < sum; i++) {
+                if (obs_per_image[i] == 0) {
+                    isolated_images++;
+                    print2Log("  WARNING: Image %d has NO observations!\n", i);
+                }
+            }
+            if (isolated_images > 0) {
+                print2Log("  WARNING: %d isolated images found! These will cause singularity.\n", isolated_images);
+            }
+
+            if (total_obs == 0) {
+                print2Log("ERROR: No observations! Check if .olp files exist.\n");
+                continue;
+            }
+
+            // ===== 迭代平差 =====
+            int max_iterations = 3;
             double sigma0 = 1.0;
-            memset(x, 0, sizeof(double) * n);
+
+            VectorXd x = VectorXd::Zero(n);
+
+            std::vector<double> obs_weights(total_obs, 1.0);
+            std::vector<double> obs_init_weights(total_obs, 1.0);
 
             for (int iter = 0; iter < max_iterations; iter++) {
                 print2Log("\n--- Iteration %d ---\n", iter + 1);
                 UINT iter_st = GetTickCount();
 
-                // 构建法方程（并行）
-                memset(aa, 0, sizeof(double) * n * n);
-                memset(b, 0, sizeof(double) * n);
+                print2Log("  Building equations (streaming)...");
 
-#pragma omp parallel
-                {
-                    double* local_aa = new double[n * n];
-                    double* local_b = new double[n];
-                    memset(local_aa, 0, sizeof(double) * n * n);
-                    memset(local_b, 0, sizeof(double) * n);
+                MatrixXd AtWA = MatrixXd::Zero(n, n);
+                VectorXd AtWb = VectorXd::Zero(n);
 
-#pragma omp for schedule(static)
-                    for (int obs_id = 0; obs_id < (int)observations.size(); obs_id++) {
-                        Observation& obs = observations[obs_id];
+                int global_obs_id = 0;
+                int processed_obs = 0;
 
-                        if (obs.weight < 0.001) continue;
+                for (i = 0; i < sum; i++) {
+                    char str[512], strT[256], strSrc[256], strRef[256], strOlp[512];
+                    int idx, idxr;
 
-                        if (obs.idxr == -1) {
-                            // 基线约束: -x0 - k1*x1 - k2*x2 + cv*x3 = rv
-                            double a[4] = { -1, -obs.k1, -obs.k2, obs.cv };
-                            double l = obs.rv;
+                    m_listCtrl.GetItemText(i, 0, str, 256);
+                    sprintf(strT, "%s%s.tsk", strRom, strrchr(str, '\\'));
 
-                            for (int ii = 0; ii < 4; ii++) {
-                                int row = obs.idx * 4 + ii;
-                                local_b[row] += obs.weight * a[ii] * l;
+                    FILE* fTsk = fopen(strT, "rt");
+                    if (!fTsk) continue;
 
-                                for (int jj = 0; jj < 4; jj++) {
-                                    int col = obs.idx * 4 + jj;
-                                    local_aa[row * n + col] += obs.weight * a[ii] * a[jj];
+                    fgets(str, 512, fTsk);
+                    sscanf(str, "%s", strSrc);
+                    DOS_PATH(strSrc);
+
+                    fgets(str, 512, fTsk);
+                    sscanf(str, "%d", &idx);
+
+                    while (!feof(fTsk)) {
+                        if (!fgets(str, 512, fTsk)) break;
+                        sscanf(str, "%s", strRef);
+                        DOS_PATH(strRef);
+
+                        if (!fgets(str, 512, fTsk)) break;
+                        sscanf(str, "%d", &idxr);
+
+                        strcpy(strOlp, strT);
+                        strcpy(strrchr(strOlp, '.'), "_");
+                        strcat(strOlp, strrchr(strRef, '\\') + 1);
+                        strcat(strOlp, ".olp");
+
+                        COlpFile olpF;
+                        if (!olpF.Load4File(strOlp)) continue;
+
+                        int oz;
+                        OBV* pOs = olpF.GetData(&oz);
+
+                        for (int v = 0; v < oz; v++, pOs++) {
+                            double k1 = getKval(1, pOs->csz, pOs->cvz, pOs->cas)/* - pAK1[idx]*/;
+                            double k2 = getKval(4, pOs->csz, pOs->cvz, pOs->cas)/* - pAK2[idx]*/;
+                            double cv = pOs->cv[c]/* / DN_SCALE*/;
+                            double rv = pOs->rv[c]/* / DN_SCALE*/;
+
+                            double k1r, k2r, init_w;
+                            if (idxr == -1) {
+                                init_w = 1.0;
+                                k1r = 0;
+                                k2r = 0;
+                            }
+                            else {
+                                init_w = 0.1;
+                                k1r = getKval(1, pOs->rsz, pOs->rvz, pOs->ras)/* - pAK1[idxr]*/;
+                                k2r = getKval(4, pOs->rsz, pOs->rvz, pOs->ras) /*- pAK2[idxr]*/;
+                            }
+
+                            if (iter == 0) {
+                                obs_init_weights[global_obs_id] = init_w;
+                                obs_weights[global_obs_id] = init_w;
+                            }
+
+                            double w = obs_weights[global_obs_id];
+                            global_obs_id++;
+
+                            if (w < 0.001) continue;
+
+                            if (idxr == -1) {
+                                // 基线约束: -x0 - k1*x1 - k2*x2 + cv*x3 = rv
+                                double a[4] = { -1.0, -k1, -k2, cv };
+                                double l = rv;
+
+                                int base_idx = idx * 4;
+
+                                // 累加到法方程（4x4块）
+                                for (int ii = 0; ii < 4; ii++) {
+                                    int row = base_idx + ii;
+                                    AtWb(row) += w * a[ii] * l;
+
+                                    for (int jj = 0; jj < 4; jj++) {
+                                        int col = base_idx + jj;
+                                        AtWA(row, col) += w * a[ii] * a[jj];
+                                    }
                                 }
                             }
-                        }
-                        else {
-                            // 相对约束
-                            double l = obs.cv - obs.rv;
+                            else {
+                                // 相对约束: (idx) - (idxr) = cv - rv
+                                double a_idx[4] = { 1.0, k1, k2, -cv };
+                                double a_idxr[4] = { -1.0, -k1r, -k2r, rv };
+                                double l = 0.0;
 
-                            // idx部分
-                            double a_idx[4] = { 1, obs.k1, obs.k2, 0 };
-                            for (int ii = 0; ii < 4; ii++) {
-                                int row = obs.idx * 4 + ii;
-                                local_b[row] += obs.weight * a_idx[ii] * l;
+                                int base_idx = idx * 4;
+                                int base_idxr = idxr * 4;
 
-                                for (int jj = 0; jj < 4; jj++) {
-                                    int col = obs.idx * 4 + jj;
-                                    local_aa[row * n + col] += obs.weight * a_idx[ii] * a_idx[jj];
+                                // 当前影像块（4x4）
+                                for (int ii = 0; ii < 4; ii++) {
+                                    int row = base_idx + ii;
+                                    AtWb(row) += w * a_idx[ii] * l;
+
+                                    for (int jj = 0; jj < 4; jj++) {
+                                        int col = base_idx + jj;
+                                        AtWA(row, col) += w * a_idx[ii] * a_idx[jj];
+                                    }
+                                }
+
+                                // 参考影像块（4x4）
+                                for (int ii = 0; ii < 4; ii++) {
+                                    int row = base_idxr + ii;
+                                    AtWb(row) += w * a_idxr[ii] * l;
+
+                                    for (int jj = 0; jj < 4; jj++) {
+                                        int col = base_idxr + jj;
+                                        AtWA(row, col) += w * a_idxr[ii] * a_idxr[jj];
+                                    }
+                                }
+
+                                // 交叉块（4x4 x 2）
+                                for (int ii = 0; ii < 4; ii++) {
+                                    for (int jj = 0; jj < 4; jj++) {
+                                        int row1 = base_idx + ii;
+                                        int col1 = base_idxr + jj;
+                                        AtWA(row1, col1) += w * a_idx[ii] * a_idxr[jj];
+
+                                        int row2 = base_idxr + ii;
+                                        int col2 = base_idx + jj;
+                                        AtWA(row2, col2) += w * a_idxr[ii] * a_idx[jj];
+                                    }
                                 }
                             }
 
-                            // idxr部分
-                            double a_idxr[4] = { -1, -obs.k1r, -obs.k2r, 0 };
-                            for (int ii = 0; ii < 4; ii++) {
-                                int row = obs.idxr * 4 + ii;
-                                local_b[row] += obs.weight * a_idxr[ii] * l;
-
-                                for (int jj = 0; jj < 4; jj++) {
-                                    int col = obs.idxr * 4 + jj;
-                                    local_aa[row * n + col] += obs.weight * a_idxr[ii] * a_idxr[jj];
-                                }
-                            }
-
-                            // 交叉项
-                            for (int ii = 0; ii < 4; ii++) {
-                                for (int jj = 0; jj < 4; jj++) {
-                                    int row = obs.idx * 4 + ii;
-                                    int col = obs.idxr * 4 + jj;
-                                    local_aa[row * n + col] += obs.weight * a_idx[ii] * a_idxr[jj];
-
-                                    row = obs.idxr * 4 + ii;
-                                    col = obs.idx * 4 + jj;
-                                    local_aa[row * n + col] += obs.weight * a_idxr[ii] * a_idx[jj];
-                                }
-                            }
+                            processed_obs++;
                         }
                     }
-
-#pragma omp critical(merge_equations)
-                    {
-                        for (int ii = 0; ii < n; ii++) {
-                            b[ii] += local_b[ii];
-                            for (int jj = 0; jj < n; jj++) {
-                                aa[ii * n + jj] += local_aa[ii * n + jj];
-                            }
-                        }
-                    }
-
-                    delete[] local_aa;
-                    delete[] local_b;
+                    fclose(fTsk);
                 }
 
-                print2Log("Equations built, ");
+                print2Log("Done (%d obs)\n", processed_obs);
 
-                // 检查并添加正则化
-                double diag_min = 1e100, diag_max = -1e100;
+                // ===== 诊断法方程 =====
+                print2Log("  Diagnosing normal equations...\n");
+
+                // 检查对角线元素
+                double diag_min = 1e100, diag_max = -1e100, diag_sum = 0.0;
+                int zero_diag = 0, small_diag = 0, diag_count = 0;
+
                 for (int ii = 0; ii < n; ii++) {
-                    double diag = aa[ii * n + ii];
-                    if (diag > 1e-15) {
-                        if (diag < diag_min) diag_min = diag;
-                        if (diag > diag_max) diag_max = diag;
+                    double d = AtWA(ii, ii);
+
+                    if (fabs(d) < 1e-15) {
+                        zero_diag++;
+                    }
+                    else if (fabs(d) < 1e-6) {
+                        small_diag++;
+                    }
+
+                    if (d > 1e-15) {
+                        if (d < diag_min) diag_min = d;
+                        if (d > diag_max) diag_max = d;
+                        diag_sum += d;
+                        diag_count++;
                     }
                 }
 
-                double regularization = diag_max * 1e-8;
+                double diag_avg = (diag_count > 0) ? (diag_sum / diag_count) : 1.0;
+                double condition_est = (diag_min > 0) ? (diag_max / diag_min) : 1e20;
+
+                print2Log("    Diagonal: min=%.2e, max=%.2e, avg=%.2e\n",
+                    diag_min, diag_max, diag_avg);
+                print2Log("    Condition estimate: %.2e\n", condition_est);
+                print2Log("    Zero diagonals: %d, Small diagonals: %d\n",
+                    zero_diag, small_diag);
+
+                if (zero_diag > 0) {
+                    print2Log("    ERROR: %d zero diagonal elements! Check for isolated images.\n", zero_diag);
+                }
+
+                if (condition_est > 1e12) {
+                    print2Log("    WARNING: Matrix is very ill-conditioned!\n");
+                }
+
+                // 检查对称性
+                double sym_error = 0.0;
                 for (int ii = 0; ii < n; ii++) {
-                    aa[ii * n + ii] += regularization;
-                }
-
-                // 求解
-                bool success = CholeskySolve(aa, b, x, n);
-                if (!success) {
-                    print2Log("Solve failed, retrying with stronger regularization...\n");
-                    for (int ii = 0; ii < n; ii++) {
-                        aa[ii * n + ii] += diag_max * 1e-6;
-                    }
-                    success = CholeskySolve(aa, b, x, n);
-                    if (!success) {
-                        print2Log("ERROR: Cannot solve!\n");
-                        break;
+                    for (int jj = ii + 1; jj < n; jj++) {
+                        sym_error += fabs(AtWA(ii, jj) - AtWA(jj, ii));
                     }
                 }
+                print2Log("    Symmetry error: %.2e\n", sym_error);
+                // ===== 添加正则化 =====
+                //print2Log("  Adding regularization...");
 
-                print2Log("Solved, ");
+                //std::vector<double> valid_diags;
+                //for (int ii = 0; ii < n; ii++) {
+                //    double d = AtWA(ii, ii);
+                //    if (d > 1e-15) {
+                //        valid_diags.push_back(d);
+                //    }
+                //}
 
-                // 计算残差和sigma0
-                double vv_sum = 0;
-                int valid_count = 0;
+                //double diag_median = 1.0;
+                //if (!valid_diags.empty()) {
+                //    std::sort(valid_diags.begin(), valid_diags.end());
+                //    diag_median = valid_diags[valid_diags.size() / 2];
+                //}
+
+                //// 自适应正则化：基于中位数
+                //double reg = diag_median * 1e-6;
+
+                //// 特殊处理：对零或极小的对角元素
+                //for (int ii = 0; ii < n; ii++) {
+                //    double d = AtWA(ii, ii);
+
+                //    if (fabs(d) < 1e-15) {
+                //        // 零对角线：给一个基准正则化
+                //        AtWA(ii, ii) = diag_median * 0.01;
+                //    }
+                //    else if (d < diag_median * 0.01) {
+                //        // 极小对角线：强正则化
+                //        AtWA(ii, ii) += reg * 100.0;
+                //    }
+                //    else {
+                //        // 正常对角线：标准正则化
+                //        AtWA(ii, ii) += reg;
+                //    }
+                //}
+
+                //print2Log("Done (reg=%.2e, median=%.2e)\n", reg, diag_median);
+
+                // ===== 求解（使用LDLT）=====
+                print2Log("  Solving system (LDLT)...");
+
+                Eigen::LDLT<MatrixXd> ldlt(AtWA);
+
+                //if (ldlt.info() != Eigen::Success) {
+                //    print2Log("FAILED!\n");
+
+                //    // 强正则化重试
+                //    print2Log("  Retrying with stronger regularization...\n");
+                //    for (int ii = 0; ii < n; ii++) {
+                //        AtWA(ii, ii) += diag_median * 0.01;
+                //    }
+
+                //    ldlt.compute(AtWA);
+                //    if (ldlt.info() != Eigen::Success) {
+                //        print2Log("ERROR: Decomposition still failed!\n");
+                //        break;
+                //    }
+                //}
+
+                x = ldlt.solve(AtWb);
+
+                if (ldlt.info() != Eigen::Success) {
+                    print2Log("FAILED!\n");
+                    break;
+                }
+
+                print2Log("Done\n");
+                // ===== 检查解的合理性 =====
+                double x_min = x.minCoeff();
+                double x_max = x.maxCoeff();
+                int nan_count = 0, inf_count = 0, large_count = 0;
+
+                for (int ii = 0; ii < n; ii++) {
+                    if (std::isnan(x(ii))) nan_count++;
+                    else if (std::isinf(x(ii))) inf_count++;
+                    else if (fabs(x(ii)) > 1e6) large_count++;
+                }
+
+                print2Log("  Solution range: [%.4f, %.4f]\n", x_min, x_max);
+                if (nan_count > 0) print2Log("  ERROR: %d NaN values!\n", nan_count);
+                if (inf_count > 0) print2Log("  ERROR: %d Inf values!\n", inf_count);
+                if (large_count > 0) print2Log("  WARNING: %d abnormally large values (>1e6)!\n", large_count);
+
+                // ===== 计算残差 =====
+                print2Log("  Computing residuals...");
+
                 std::vector<double> abs_residuals;
-                abs_residuals.reserve(observations.size());
+                abs_residuals.reserve(total_obs);
 
-#pragma omp parallel for reduction(+:vv_sum,valid_count)
-                for (int obs_id = 0; obs_id < (int)observations.size(); obs_id++) {
-                    Observation& obs = observations[obs_id];
+                double vv_sum = 0.0;
+                int valid_count = 0;
+                global_obs_id = 0;
 
-                    if (obs.weight < 0.001) continue;
+                for (i = 0; i < sum; i++) {
+                    char str[512], strT[256], strSrc[256], strRef[256], strOlp[512];
+                    int idx, idxr;
 
-                    double computed;
-                    if (obs.idxr == -1) {
-                        computed = -x[obs.idx * 4 + 0]
-                            - obs.k1 * x[obs.idx * 4 + 1]
-                            - obs.k2 * x[obs.idx * 4 + 2]
-                            + obs.cv * x[obs.idx * 4 + 3];
-                        obs.residual = computed - obs.rv;
+                    m_listCtrl.GetItemText(i, 0, str, 256);
+                    sprintf(strT, "%s%s.tsk", strRom, strrchr(str, '\\'));
+
+                    FILE* fTsk = fopen(strT, "rt");
+                    if (!fTsk) continue;
+
+                    fgets(str, 512, fTsk);
+                    sscanf(str, "%s", strSrc);
+                    DOS_PATH(strSrc);
+
+                    fgets(str, 512, fTsk);
+                    sscanf(str, "%d", &idx);
+
+                    while (!feof(fTsk)) {
+                        if (!fgets(str, 512, fTsk)) break;
+                        sscanf(str, "%s", strRef);
+                        DOS_PATH(strRef);
+
+                        if (!fgets(str, 512, fTsk)) break;
+                        sscanf(str, "%d", &idxr);
+
+                        strcpy(strOlp, strT);
+                        strcpy(strrchr(strOlp, '.'), "_");
+                        strcat(strOlp, strrchr(strRef, '\\') + 1);
+                        strcat(strOlp, ".olp");
+
+                        COlpFile olpF;
+                        if (!olpF.Load4File(strOlp)) continue;
+
+                        int oz;
+                        OBV* pOs = olpF.GetData(&oz);
+
+                        for (int v = 0; v < oz; v++, pOs++) {
+                            double k1 = getKval(1, pOs->csz, pOs->cvz, pOs->cas)/* - pAK1[idx];*/;
+                            double k2 = getKval(4, pOs->csz, pOs->cvz, pOs->cas)/* - pAK2[idx];*/;
+                            double cv = pOs->cv[c]/* / DN_SCALE*/;
+                            double rv = pOs->rv[c]/* / DN_SCALE*/;
+
+                            double k1r, k2r;
+                            if (idxr == -1) {
+                                k1r = 0;
+                                k2r = 0;
+                            }
+                            else {
+                                k1r = getKval(1, pOs->rsz, pOs->rvz, pOs->ras)/* - pAK1[idxr]*/;
+                                k2r = getKval(4, pOs->rsz, pOs->rvz, pOs->ras) /*- pAK2[idxr]*/;
+                            }
+
+                            double w = obs_weights[global_obs_id];
+
+                            if (w >= 0.001) {
+                                double residual;
+                                if (idxr == -1) {
+                                    double computed = -x(idx * 4) - k1 * x(idx * 4 + 1) - k2 * x(idx * 4 + 2) + cv * x(idx * 4 + 3);
+                                    residual = computed - rv;
+                                }
+                                else {
+                                    double val_idx = x(idx * 4) + k1 * x(idx * 4 + 1) + k2 * x(idx * 4 + 2) - cv * x(idx * 4 + 3);
+                                    double val_idxr = x(idxr * 4) + k1r * x(idxr * 4 + 1) + k2r * x(idxr * 4 + 2) - rv * x(idxr * 4 + 3);
+                                    residual = val_idx - val_idxr;
+                                }
+
+                                vv_sum += residual * residual * w;
+                                valid_count++;
+                                abs_residuals.push_back(fabs(residual));
+                            }
+
+                            global_obs_id++;
+                        }
                     }
-                    else {
-                        computed = (x[obs.idx * 4 + 0] + obs.k1 * x[obs.idx * 4 + 1]
-                            + obs.k2 * x[obs.idx * 4 + 2] - obs.cv)
-                            - (x[obs.idxr * 4 + 0] + obs.k1r * x[obs.idxr * 4 + 1]
-                                + obs.k2r * x[obs.idxr * 4 + 2] - obs.rv);
-                        obs.residual = computed;
-                    }
-
-                    vv_sum += obs.residual * obs.residual * obs.weight;
-                    valid_count++;
-
-#pragma omp critical(push_residual)
-                    {
-                        abs_residuals.push_back(fabs(obs.residual));
-                    }
+                    fclose(fTsk);
                 }
 
-                // 使用MAD计算sigma0（更稳健）
                 std::sort(abs_residuals.begin(), abs_residuals.end());
                 sigma0 = abs_residuals[abs_residuals.size() / 2] * 1.4826;
                 double rmse = sqrt(vv_sum / valid_count);
 
-                print2Log("sigma0=%.4f, RMSE=%.4f, ", sigma0, rmse);
+                print2Log("Done\n");
+                print2Log("  Statistics (normalized): sigma0=%.4f, RMSE=%.4f\n", sigma0, rmse);
+                //print2Log("  Statistics (DN units): sigma0=%.1f, RMSE=%.1f\n",
+                //    sigma0* DN_SCALE, rmse* DN_SCALE);
 
-                // 最后一次迭代不更新权重
                 if (iter == max_iterations - 1) {
-                    print2Log("Done\n");
                     break;
                 }
 
-                // 更新权重（IGG3）
+                // ===== 更新权重 =====
+                print2Log("  Updating weights...");
+
                 int outlier_count = 0;
+                for (size_t oid = 0; oid < abs_residuals.size(); oid++) {
+                    double std_res = abs_residuals[oid] / (sigma0 + 1e-10);
+                    double new_w = IGG3Weight(std_res, obs_init_weights[oid]);
 
-#pragma omp parallel for reduction(+:outlier_count)
-                for (int obs_id = 0; obs_id < (int)observations.size(); obs_id++) {
-                    Observation& obs = observations[obs_id];
-
-                    double std_residual = obs.residual / (sigma0 + 1e-10);
-                    double new_weight = IGG3Weight(std_residual, obs.init_weight);
-
-                    if (new_weight < obs.weight * 0.8) {
+                    if (new_w < obs_weights[oid] * 0.8) {
                         outlier_count++;
                     }
 
-                    obs.weight = new_weight;
+                    obs_weights[oid] = new_w;
                 }
 
-                print2Log("Outliers=%d(%.1f%%), %.2fs\n",
-                    outlier_count, 100.0 * outlier_count / observations.size(),
-                    (GetTickCount() - iter_st) * 0.001);
+                print2Log("Done (outliers=%d, %.1f%%)\n",
+                    outlier_count, 100.0 * outlier_count / abs_residuals.size());
+                print2Log("  Time: %.2fs\n", (GetTickCount() - iter_st) * 0.001);
 
                 ProgStep(cancel);
             }
 
-            // 检查解的质量
-            double x_min = 1e100, x_max = -1e100;
-            int nan_count = 0;
-
-            for (int ii = 0; ii < n; ii++) {
-                if (!isfinite(x[ii])) {
-                    nan_count++;
-                }
-                else {
-                    if (x[ii] < x_min) x_min = x[ii];
-                    if (x[ii] > x_max) x_max = x[ii];
-                }
-            }
-
-            print2Log("Solution: [%.4f, %.4f], ", x_min, x_max);
-            print2Log("Status: %s\n", nan_count == 0 ? "Good" : "Fail");
-
-            // 输出结果
+            // ===== 输出结果 =====
             sprintf(str, "%s//pre_bnd%d.txt", strRom, c + 1);
             FILE* fKnl = fopen(str, "wt");
-            for (i = 0; i < sum; i++) {
-                m_listCtrl.GetItemText(i, 0, str, 256);
-                fprintf(fKnl, "%9.6lf \t %15.6lf \t %15.6lf \t %15.6lf \t %s\n",
-                    x[i * 4 + 3], x[i * 4 + 0], x[i * 4 + 1], x[i * 4 + 2],
-                    strrchr(str, '\\'));
+            if (fKnl) {
+                for (i = 0; i < sum; i++) {
+                    m_listCtrl.GetItemText(i, 0, str, 256);
+                    fprintf(fKnl, "%9.6lf \t %15.6lf \t %15.6lf \t %15.6lf \t %s\n",
+                        x(i * 4 + 3), x(i * 4), x(i * 4 + 1), x(i * 4 + 2),
+                        strrchr(str, '\\'));
+                }
+                fclose(fKnl);
             }
-            fclose(fKnl);
 
             print2Log("Band %d done. Total: %.2fs\n\n",
                 c + 1, (GetTickCount() - st) * 0.001);
         }
 
-        delete[] aa;
-        delete[] b;
-        delete[] x;
+        delete[]pAK1;
 
         ProgEnd();
-        print2Log("RadBA over.\n");
+        print2Log("RadBA completed.\n");
     }
 
    	if (m_hW4EndHdl) ::SetEvent( m_hW4EndHdl );
