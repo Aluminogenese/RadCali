@@ -34,8 +34,8 @@ public:
     void SetSize(int sz){ m_obs.SetSize(sz); }    
     OBV* GetData(int *sz){ return m_obs.GetData(*sz); }   
     int  Append( OBV obv ){ return  m_obs.Append(obv); }
-    int  Append( double sz ,double  vz,double  as,int cc,int cr,WORD* cv,
-                 double sz1,double vz1,double as1,int rc,int rr,WORD* rv ){
+    int  Append( double sz ,double  vz,double  as,int cc,int cr,const WORD* cv,
+                 double sz1,double vz1,double as1,int rc,int rr,const WORD* rv ){
         OBV obv={ cc,cr,rc,rr,(float)cv[0],(float)cv[1],(float)cv[2],(float)cv[3],
             (float)rv[0],(float)rv[1],(float)rv[2],(float)rv[3],sz,vz,as,sz1,vz1,as1 };
         return Append(obv);

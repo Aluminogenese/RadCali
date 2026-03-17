@@ -89,6 +89,7 @@ public:
     CWuEdit	    m_editRet;
     CString	    m_strRet;
 	CString	m_strBas;
+    CString m_strLasDir;
 	int		m_gs;
 	int		m_ws;
 	BOOL	m_bTie;
