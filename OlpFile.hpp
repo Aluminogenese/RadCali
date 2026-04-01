@@ -1,4 +1,4 @@
-/*----------------------------------------------------------------------+
+﻿/*----------------------------------------------------------------------+
 |     OlpFile                                                           |
 |       Author:     DuanYanSong  2025/06/27                             |
 |            Ver 1.0                                                    |
@@ -110,6 +110,97 @@ public:
         char strTag[8];
         int ptSum;
     }m_olpHdr;
+
+    // ── 新增：获取带质量权重的观测值数组 ──
+    struct ObsWithWeight {
+        OBV* pObs;           // 观测值
+        double* pWeights;    // 初始权重
+        int count;
+    };
+
+    // 从多个质量文件合并加载，返回带权重的观测集合
+    ObsWithWeight LoadMergedWithWeights(
+        const char* strExcellent,   // QUALITY_EXCELLENT
+        const char* strGood,        // QUALITY_GOOD
+        const char* strFair,        // QUALITY_FAIR
+        const char* strPoor)        // QUALITY_POOR
+    {
+        ObsWithWeight result = { NULL, NULL, 0 };
+
+        // 加载各质量等级的文件
+        COlpFile olpEx, olpGd, olpFr, olpPr;
+        int nEx = 0, nGd = 0, nFr = 0, nPr = 0;
+
+        if (strExcellent && strExcellent[0]) {
+            olpEx.Load4File(strExcellent);
+            nEx = olpEx.GetSize();
+        }
+        if (strGood && strGood[0]) {
+            olpGd.Load4File(strGood);
+            nGd = olpGd.GetSize();
+        }
+        if (strFair && strFair[0]) {
+            olpFr.Load4File(strFair);
+            nFr = olpFr.GetSize();
+        }
+        if (strPoor && strPoor[0]) {
+            olpPr.Load4File(strPoor);
+            nPr = olpPr.GetSize();
+        }
+
+        int totalN = nEx + nGd + nFr + nPr;
+        if (totalN <= 0) return result;
+
+        // 分配内存
+        result.pObs = new OBV[totalN];
+        result.pWeights = new double[totalN];
+        result.count = totalN;
+
+        int idx = 0;
+        OBV* p;
+        int dummy = 0;
+
+        // 1.0 权重：优秀点（最可靠）
+        if (nEx > 0) {
+            p = olpEx.GetData(&dummy);
+            memcpy(result.pObs + idx, p, nEx * sizeof(OBV));
+            std::fill(result.pWeights + idx, result.pWeights + idx + nEx, 1.0);
+            idx += nEx;
+        }
+
+        // 0.8 权重：良好点
+        if (nGd > 0) {
+            p = olpGd.GetData(&dummy);
+            memcpy(result.pObs + idx, p, nGd * sizeof(OBV));
+            std::fill(result.pWeights + idx, result.pWeights + idx + nGd, 0.6);
+            idx += nGd;
+        }
+
+        // 0.5 权重：一般点（可选，视情况包含）
+        if (nFr > 0) {
+            p = olpFr.GetData(&dummy);
+            memcpy(result.pObs + idx, p, nFr * sizeof(OBV));
+            std::fill(result.pWeights + idx, result.pWeights + idx + nFr, 0.25);
+            idx += nFr;
+        }
+
+        // 0.2 权重：较差点（可选，低权重参与或完全排除）
+        if (nPr > 0) {
+            p = olpPr.GetData(&dummy);
+            memcpy(result.pObs + idx, p, nPr * sizeof(OBV));
+            std::fill(result.pWeights + idx, result.pWeights + idx + nPr, 0.05);
+            idx += nPr;
+        }
+
+        return result;
+    }
+
+    // 清理合并结果
+    static void FreeMergedWeights(ObsWithWeight& mw) {
+        if (mw.pObs) { delete[] mw.pObs; mw.pObs = NULL; }
+        if (mw.pWeights) { delete[] mw.pWeights; mw.pWeights = NULL; }
+        mw.count = 0;
+    }
 };
 
 #endif

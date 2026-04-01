@@ -76,6 +76,8 @@ public:
 
     CString m_strDom;
     int     m_utmZn;
+    BOOL m_bUseSpatialVarying;  // 是否使用空间变化
+    double m_smoothWeight;       // 平滑权重
 
 // Dialog Data
 	//{{AFX_DATA(CRadCaliDlg)

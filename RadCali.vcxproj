@@ -137,6 +137,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="RadCaliDlg.cpp" />
+    <ClCompile Include="SpatialRadBA.cpp" />
     <ClCompile Include="StdAfx.cpp">
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">Create</PrecompiledHeader>
       <PrecompiledHeaderFile Condition="'$(Configuration)|$(Platform)'=='Release|x64'">stdafx.h</PrecompiledHeaderFile>
@@ -147,6 +148,7 @@
   <ItemGroup>
     <ClInclude Include="RadCaliDlg.h" />
     <ClInclude Include="resource.h" />
+    <ClInclude Include="SpatialRadBA.h" />
     <ClInclude Include="StdAfx.h" />
   </ItemGroup>
   <ItemGroup>

@@ -53,7 +53,6 @@
 #include <Eigen/Sparse>
 #include <vector>
 #include <algorithm>
-#include "SpatialRadBA.h"
 
 using Eigen::VectorXd;
 using Eigen::MatrixXd;
@@ -207,9 +206,6 @@ CRadCaliDlg::CRadCaliDlg(CWnd* pParent /*=NULL*/)
     m_hEThEHdl = m_hW4EndHdl = NULL;
     memset( gs_hThreadId,0,sizeof(gs_hThreadId) );
     memset( gs_hProcId,0,sizeof(gs_hProcId) );
-
-    m_bUseSpatialVarying = TRUE;   // 默认使用空间变化
-    m_smoothWeight = 0.1;          // 默认平滑权重
 }
 
 void CRadCaliDlg::DoDataExchange(CDataExchange* pDX)
@@ -734,10 +730,784 @@ inline double IGG3Weight(double std_residual, double init_weight, double k0 = 2.
         return 0.01 * init_weight;  // 保留1%
     }
 }
-/*----------------------------------------------------------------------
- *  CTifAffine：单幅 TIFF 的仿射参数 + 整幅影像内存数据
- *  影像读取完全由 GDAL 完成，支持任意波段数和位深的 GeoTIFF。
- *----------------------------------------------------------------------*/
+
+void CRadCaliDlg::Process()
+{
+    gs_hWnd = m_hWnd;
+	m_hEThEHdl = ::CreateEvent( NULL,TRUE,FALSE,itostr( LONG(this) ) );
+    
+    CTime stTm; SYSTEM_INFO sysInfo; GetSystemInfo (&sysInfo);   
+    if (sysInfo.dwNumberOfProcessors>MAX_CPU) sysInfo.dwNumberOfProcessors=MAX_CPU;
+    BOOL bRun = FALSE; int maxTm=120,cpuSum = atoi( m_strMxCore ); 
+    if (cpuSum<1) cpuSum = 1;  if (cpuSum>sysInfo.dwNumberOfProcessors-1) cpuSum = sysInfo.dwNumberOfProcessors-1;
+    char strCmd[1024],strExe[256]; ::GetModuleFileName(NULL,strExe,sizeof(strExe));
+
+    m_strMxCore.Format("%d",cpuSum );
+    AfxGetApp()->WriteProfileString( "CRadCaliDlg","CPUs",m_strMxCore );  
+
+    char *pS,strDir[256],strT[256],str[512];
+    strcpy( strDir,m_strRet ); pS = strrchr( strDir,'\\' ); if (pS) *pS=0;
+    
+    char strRom[256]; sprintf( strRom,"%s\\ROM_S2B_0.02mLas",strDir );
+    CreateDir( strRom );
+
+    char strLog[256]; strcpy( strLog,m_strRet );
+    sprintf( str,"%s-s2b.log",strLog ); 
+    ::DeleteFile(str);  openLog(str);  
+
+    int i,j,c,b,sum = m_listCtrl.GetItemCount();
+    ///////////////////////////////////    
+    struct RI{
+        int idx;
+        float area;
+    }; RI iRi,*pRi = new RI[sum+8];
+    struct RGN{
+        double x[8];
+        double y[8];
+        int sz;
+    }; RGN iRg,*pRg = new RGN[sum+8];
+    memset( pRg,0,sizeof(RGN)*sum );
+    IMGPAR imgPar; CTMGeom cc; 
+    double xs,ys,zs,phi,omg,kap,grdZ;
+    sprintf( strT,"%s\\imgPar.dpi",strDir ); DOS_PATH(strT); 
+    CTMVziFile vziFile; vziFile.Load4File(strT); 
+    for( i=0;i<sum;i++ ){
+        m_listCtrl.GetItemText(i,1,str,256);
+        imgPar = vziFile.m_imgPar;
+        sscanf( str,"%lf%lf%lf%lf%lf%lf%lf",&xs,&ys,&zs,&phi,&omg,&kap,&grdZ );        
+        imgPar.aopX = xs; imgPar.aopY = ys; imgPar.aopZ = zs;
+        imgPar.aopP = phi;imgPar.aopO = omg;imgPar.aopK = kap;
+        cc.Init( &imgPar ); pRg[i].sz = 4;
+        cc.GetGrdPrjRgn( imgPar.iopX*2,imgPar.iopY*2,grdZ,pRg[i].x,pRg[i].y );
+    }
+
+    // ── LAS 目录（写入任务文件供 MchTie 使用）──────────────────────
+    char strLasDir[512] = {};
+    if (!m_strLasDir.IsEmpty())
+        strcpy(strLasDir, (LPCSTR)m_strLasDir);
+
+    if (m_bTie) print2Log( "MchTie start...\n" );
+    ///////////////////////////////////    
+    ProgBegin(sum); int cancel;
+    for( i=0;i<sum;i++,ProgStep(cancel) )
+	{
+		if ( ::WaitForSingleObject(m_hEThEHdl,1)==WAIT_OBJECT_0 ) break;
+
+        m_listCtrl.GetItemText(i,0,str,256);  print2Log("process: %s\n",strrchr(str,'\\') );
+        sprintf( strT,"%s%s.tsk",strRom,strrchr(str,'\\') );
+        FILE *fTsk = fopen( strT,"wt" );
+        fprintf( fTsk,"%s\n%d %s %d %d %d\n",str,i,m_listCtrl.GetItemText(i,1),m_gs,m_ws,m_bTxt );
+        // LAS 目录
+        if (strLasDir[0])
+            fprintf(fTsk, "LAS=%s\n", strLasDir);
+
+        fprintf( fTsk,"%s\n%s\n",m_strBas,"-1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 " );
+
+        /////////////////////////////////////////////
+        iRi.area = (float)(GetRgnArea( pRg[i].x,pRg[i].y,pRg[i].sz ));
+        memset( pRi,0,sizeof(RI)*sum );
+        for( j=0;j<sum;j++ ){
+            if ( j==i ) continue;
+            iRg.sz = 0;
+            RgnClip( pRg[i].x,pRg[i].y,pRg[i].sz,
+                pRg[j].x,pRg[j].y,pRg[j].sz,
+                iRg.x,iRg.y,&iRg.sz );
+            if ( iRg.sz>2 ){
+                pRi[j].idx = j;
+                pRi[j].area = (float)(GetRgnArea( iRg.x,iRg.y,iRg.sz ));
+        }
+    }
+        qsort( pRi,sum,sizeof(RI),&comRI );
+        for( j=0;j<sum;j++ ){
+            if ( pRi[j].area/iRi.area<0.01  ) break;
+
+            fprintf( fTsk,"%s\n",m_listCtrl.GetItemText( pRi[j].idx,0 ) );
+            fprintf( fTsk,"%d %s\n",pRi[j].idx,m_listCtrl.GetItemText( pRi[j].idx,1 ) );
+        }
+        /////////////////////////////////////////////
+        fclose( fTsk );
+
+        if (m_bTie){
+#ifdef _DEBUG
+            sprintf(strCmd, "TIE@%s",strT ); 
+            MchTie( strCmd ); 
+            //break;
+#else
+            sprintf(strCmd, "%s TIE@%s",strExe,strT ); 
+            print2Log( "%s\n",strCmd );
+#endif
+
+            bRun = FALSE; 
+            while( !bRun ){
+                for (int c=0;c<cpuSum;c++ ){
+                    if ( gs_hThreadId[c]==NULL ){
+                        strcpy( gs_strCmd[c],strCmd );
+                        HANDLE hThread = ::CreateThread( NULL,0,CupThread_CRadCaliDlg,(void*)gs_strCmd[c],0,gs_hThreadId+c );
+                        ::CloseHandle( hThread ); bRun = TRUE; break;
+                    }
+                    if ( ::WaitForSingleObject(m_hEThEHdl,16)==WAIT_OBJECT_0 ) break;
+                }
+            }
+        }   
+	}
+    delete []pRi;
+    delete []pRg;
+
+    // waiting all process over in maxTm 
+    stTm = CTime::GetCurrentTime();
+    while( 1 ){
+        for ( c=0;c<MAX_CPU;c++ ){ if ( gs_hThreadId[c]!=NULL ) break; }
+        if ( c==MAX_CPU || ::WaitForSingleObject(m_hEThEHdl,128)==WAIT_OBJECT_0 ) break;
+        // Terminate the process
+        CTimeSpan ts = CTime::GetCurrentTime()-stTm;
+        if ( ts.GetTotalMinutes()>maxTm ){
+            for ( int i=0;i<MAX_CPU;i++ ){
+                if ( gs_hProcId[i] ){
+                    HANDLE hProc = ::OpenProcess( PROCESS_TERMINATE,FALSE,gs_hProcId[i] );
+                    if ( hProc ) ::TerminateProcess( hProc,0x22 );
+                    gs_hProcId[i] = 0; Sleep(8);
+                }
+            }
+            break;
+        }
+    }
+    if (m_bTie) print2Log( "MchTie over.\n" );
+    ProgEnd();  
+
+    /////////////////////////////////
+    COlpFile olpF; char strSrc[256],strRef[256],strOlp[512]; int idx,idxr;
+    if (m_bAdj) {
+        print2Log("RadBA start...\n");
+
+        //double* pAK1 = new double[sum * 2];
+        //double* pAK2 = pAK1 + sum;
+        //memset(pAK1, 0, sizeof(double) * sum * 2);
+        //for (i = 0; i < sum; i++) {
+        //    m_listCtrl.GetItemText(i, 0, str, 256);
+        //    sprintf(strT, "%s%s.tsk_skm.txt", strRom, strrchr(str, '\\'));
+        //    FILE* fKM = fopen(strT, "rt");
+        //    fscanf(fKM, "%lf%lf", pAK1 + i, pAK2 + i);   print2Log("%lf %lf\n", pAK1[i], pAK2[i]);
+        //    fclose(fKM);
+        //}
+
+        int n = sum * 4;
+        print2Log("System size: %d unknowns\n", n);
+
+        //double* aa = new double[n * n];
+        //double* b = new double[n];
+        //double* x = new double[n];
+
+        ProgBegin(sum * 4);
+
+        for (c = 0; c < 4; c++) {
+            UINT st = GetTickCount();
+            print2Log("\n========== Band %d ==========\n", c + 1);
+
+            print2Log("Step 1: Counting observations...\n");
+
+            int total_obs = 0;
+            int baseline_obs = 0;  // 基线约束数量
+            int relative_obs = 0;  // 相对约束数量
+            int loaded_files = 0;
+            std::vector<int> obs_per_image(sum, 0);  // 每张影像的观测值数量
+
+            for (i = 0; i < sum; i++) {
+                char str[512], strT[256], strSrc[256], strRef[256], strOlp[512];
+                int idx, idxr;
+
+                m_listCtrl.GetItemText(i, 0, str, 256);
+                sprintf(strT, "%s%s.tsk", strRom, strrchr(str, '\\'));
+
+                FILE* fTsk = fopen(strT, "rt");
+                if (!fTsk) continue;
+
+                fgets(str, 512, fTsk);
+                sscanf(str, "%s", strSrc);
+                DOS_PATH(strSrc);
+
+                fgets(str, 512, fTsk);
+                sscanf(str, "%d", &idx);
+
+                if (!m_strLasDir.IsEmpty()) {
+                    fgets(str, 512, fTsk);
+                }
+
+                while (!feof(fTsk)) {
+                    if (!fgets(str, 512, fTsk)) break;
+                    sscanf(str, "%s", strRef);
+                    DOS_PATH(strRef);
+
+                    if (!fgets(str, 512, fTsk)) break;
+                    sscanf(str, "%d", &idxr);
+
+                    strcpy(strOlp, strT);
+                    strcpy(strrchr(strOlp, '.'), "_");
+                    strcat(strOlp, strrchr(strRef, '\\') + 1);
+                    strcat(strOlp, ".olp");
+
+                    COlpFile olpF;
+                    if (olpF.Load4File(strOlp)) {
+                        int oz;
+                        olpF.GetData(&oz);
+                        total_obs += oz;
+                        obs_per_image[idx] += oz;
+
+                        if (idxr == -1) {
+                            baseline_obs += oz;
+                }
+                        else {
+                            relative_obs += oz;
+                            obs_per_image[idxr] += oz;
+                        }
+
+                        loaded_files++;
+                    }
+                }
+                fclose(fTsk);
+            }
+
+            print2Log("Total observations: %d (from %d files)\n", total_obs, loaded_files);
+            print2Log("  Baseline constraints: %d\n", baseline_obs);
+            print2Log("  Relative constraints: %d\n", relative_obs);
+
+            // 检查孤立影像
+            int isolated_images = 0;
+            for (i = 0; i < sum; i++) {
+                if (obs_per_image[i] == 0) {
+                    isolated_images++;
+                    print2Log("  WARNING: Image %d has NO observations!\n", i);
+                }
+            }
+            if (isolated_images > 0) {
+                print2Log("  WARNING: %d isolated images found! These will cause singularity.\n", isolated_images);
+            }
+
+            if (total_obs == 0) {
+                print2Log("ERROR: No observations! Check if .olp files exist.\n");
+                continue;
+            }
+
+            // ===== 迭代平差 =====
+            int max_iterations = 3;
+            double sigma0 = 1.0;
+
+            VectorXd x = VectorXd::Zero(n);
+
+            std::vector<double> obs_weights(total_obs, 1.0);
+            std::vector<double> obs_init_weights(total_obs, 1.0);
+
+            for (int iter = 0; iter < max_iterations; iter++) {
+                print2Log("\n--- Iteration %d ---\n", iter + 1);
+                UINT iter_st = GetTickCount();
+
+                print2Log("  Building equations (streaming)...");
+
+                MatrixXd AtWA = MatrixXd::Zero(n, n);
+                VectorXd AtWb = VectorXd::Zero(n);
+
+                int global_obs_id = 0;
+                int processed_obs = 0;
+
+                for (i = 0; i < sum; i++) {
+                    char str[512], strT[256], strSrc[256], strRef[256], strOlp[512];
+                    int idx, idxr;
+
+                    m_listCtrl.GetItemText(i, 0, str, 256);
+                    sprintf(strT, "%s%s.tsk", strRom, strrchr(str, '\\'));
+
+                    FILE* fTsk = fopen(strT, "rt");
+                    if (!fTsk) continue;
+
+                    fgets(str, 512, fTsk);
+                    sscanf(str, "%s", strSrc);
+                    DOS_PATH(strSrc);
+
+                    fgets(str, 512, fTsk);
+                    sscanf(str, "%d", &idx);
+
+                    if (!m_strLasDir.IsEmpty()) {
+                        fgets(str, 512, fTsk);
+                    }
+                    while (!feof(fTsk)) {
+                        if (!fgets(str, 512, fTsk)) break;
+                        sscanf(str, "%s", strRef);
+                        DOS_PATH(strRef);
+
+                        if (!fgets(str, 512, fTsk)) break;
+                        sscanf(str, "%d", &idxr);
+
+                        strcpy(strOlp, strT);
+                        strcpy(strrchr(strOlp, '.'), "_");
+                        strcat(strOlp, strrchr(strRef, '\\') + 1);
+                        strcat(strOlp, ".olp");
+
+                        COlpFile olpF;
+                        if (!olpF.Load4File(strOlp)) continue;
+
+                        int oz;
+                        OBV* pOs = olpF.GetData(&oz);
+
+                        for (int v = 0; v < oz; v++, pOs++) {
+                            double k1 = getKval(1, pOs->csz, pOs->cvz, pOs->cas)/* - pAK1[idx]*/;
+                            double k2 = getKval(4, pOs->csz, pOs->cvz, pOs->cas)/* - pAK2[idx]*/;
+                            double cv = pOs->cv[c]/* / DN_SCALE*/;
+                            double rv = pOs->rv[c]/* / DN_SCALE*/;
+
+                            double k1r, k2r, init_w;
+                            if (idxr == -1) {
+                                init_w = 1.0;
+                                k1r = 0;
+                                k2r = 0;
+                            }
+                            else {
+                                init_w = 0.1;
+                                k1r = getKval(1, pOs->rsz, pOs->rvz, pOs->ras)/* - pAK1[idxr]*/;
+                                k2r = getKval(4, pOs->rsz, pOs->rvz, pOs->ras) /*- pAK2[idxr]*/;
+                            }
+
+                            if (iter == 0) {
+                                obs_init_weights[global_obs_id] = init_w;
+                                obs_weights[global_obs_id] = init_w;
+                            }
+
+                            double w = obs_weights[global_obs_id];
+                            global_obs_id++;
+
+                            if (w < 0.001) continue;
+
+                            if (idxr == -1) {
+                                // 基线约束: -x0 - k1*x1 - k2*x2 + cv*x3 = rv
+                                double a[4] = { 1.0, k1, k2, -cv };
+                                double l = -rv;
+
+                                int base_idx = idx * 4;
+
+                                // 累加到法方程（4x4块）
+                                for (int ii = 0; ii < 4; ii++) {
+                                    int row = base_idx + ii;
+                                    AtWb(row) += w * a[ii] * l;
+
+                                    for (int jj = 0; jj < 4; jj++) {
+                                        int col = base_idx + jj;
+                                        AtWA(row, col) += w * a[ii] * a[jj];
+                                }
+                            }
+                            }
+                            else {
+                                // 相对约束：同名点校正后反射率相等
+                                // val_i = a0_i + k1_i*a1_i + k2_i*a2_i - cv*s_i
+                                // val_j = a0_j + k1j*a1_j + k2j*a2_j - rv*s_j
+                                // 约束：val_i - val_j = 0
+                                // 偏导（系数向量）与 val 定义一致
+                                double a_idx[4] = { 1.0,  k1,   k2,  0.0 };
+                                double a_idxr[4] = { -1.0, -k1r, -k2r,  0.0 };
+                                double l = cv - rv;
+
+                                int base_idx = idx * 4;
+                                int base_idxr = idxr * 4;
+
+                                // 当前影像块（4x4）
+                                for (int ii = 0; ii < 4; ii++) {
+                                    int row = base_idx + ii;
+                                    AtWb(row) += w * a_idx[ii] * l;
+
+                                    for (int jj = 0; jj < 4; jj++) {
+                                        int col = base_idx + jj;
+                                        AtWA(row, col) += w * a_idx[ii] * a_idx[jj];
+                                    }
+                                }
+
+                                // 参考影像块（4x4）
+                                for (int ii = 0; ii < 4; ii++) {
+                                    int row = base_idxr + ii;
+                                    AtWb(row) += w * a_idxr[ii] * l;
+
+                                    for (int jj = 0; jj < 4; jj++) {
+                                        int col = base_idxr + jj;
+                                        AtWA(row, col) += w * a_idxr[ii] * a_idxr[jj];
+                            }
+                        }
+
+                                // 交叉块（4x4 x 2）
+                                for (int ii = 0; ii < 4; ii++) {
+                                    for (int jj = 0; jj < 4; jj++) {
+                                        int row1 = base_idx + ii;
+                                        int col1 = base_idxr + jj;
+                                        AtWA(row1, col1) += w * a_idx[ii] * a_idxr[jj];
+
+                                        int row2 = base_idxr + ii;
+                                        int col2 = base_idx + jj;
+                                        AtWA(row2, col2) += w * a_idxr[ii] * a_idx[jj];
+                    }
+                                }
+                            }
+
+                            processed_obs++;
+                        }
+                    }
+                    fclose(fTsk);
+                }
+
+                print2Log("Done (%d obs)\n", processed_obs);
+
+                // ===== 诊断法方程 =====
+                print2Log("  Diagnosing normal equations...\n");
+
+                // 检查对角线元素
+                double diag_min = 1e100, diag_max = -1e100, diag_sum = 0.0;
+                int zero_diag = 0, small_diag = 0, diag_count = 0;
+
+                for (int ii = 0; ii < n; ii++) {
+                    double d = AtWA(ii, ii);
+
+                    if (fabs(d) < 1e-15) {
+                        zero_diag++;
+                    }
+                    else if (fabs(d) < 1e-6) {
+                        small_diag++;
+                }
+
+                    if (d > 1e-15) {
+                        if (d < diag_min) diag_min = d;
+                        if (d > diag_max) diag_max = d;
+                        diag_sum += d;
+                        diag_count++;
+                }
+                }
+
+                double diag_avg = (diag_count > 0) ? (diag_sum / diag_count) : 1.0;
+                double condition_est = (diag_min > 0) ? (diag_max / diag_min) : 1e20;
+
+                print2Log("    Diagonal: min=%.2e, max=%.2e, avg=%.2e\n",
+                    diag_min, diag_max, diag_avg);
+                print2Log("    Condition estimate: %.2e\n", condition_est);
+                print2Log("    Zero diagonals: %d, Small diagonals: %d\n",
+                    zero_diag, small_diag);
+
+                if (zero_diag > 0) {
+                    print2Log("    ERROR: %d zero diagonal elements! Check for isolated images.\n", zero_diag);
+                }
+
+                if (condition_est > 1e12) {
+                    print2Log("    WARNING: Matrix is very ill-conditioned!\n");
+                }
+
+                // 检查对称性
+                double sym_error = 0.0;
+                for (int ii = 0; ii < n; ii++) {
+                    for (int jj = ii + 1; jj < n; jj++) {
+                        sym_error += fabs(AtWA(ii, jj) - AtWA(jj, ii));
+                    }
+                }
+                print2Log("    Symmetry error: %.2e\n", sym_error);
+                // ===== 添加正则化 =====
+                //print2Log("  Adding regularization...");
+
+                //std::vector<double> valid_diags;
+                //for (int ii = 0; ii < n; ii++) {
+                //    double d = AtWA(ii, ii);
+                //    if (d > 1e-15) {
+                //        valid_diags.push_back(d);
+                //    }
+                //}
+
+                //double diag_median = 1.0;
+                //if (!valid_diags.empty()) {
+                //    std::sort(valid_diags.begin(), valid_diags.end());
+                //    diag_median = valid_diags[valid_diags.size() / 2];
+                //}
+
+                //// 自适应正则化：基于中位数
+                //double reg = diag_median * 1e-6;
+
+                //// 特殊处理：对零或极小的对角元素
+                //for (int ii = 0; ii < n; ii++) {
+                //    double d = AtWA(ii, ii);
+
+                //    if (fabs(d) < 1e-15) {
+                //        // 零对角线：给一个基准正则化
+                //        AtWA(ii, ii) = diag_median * 0.01;
+                //    }
+                //    else if (d < diag_median * 0.01) {
+                //        // 极小对角线：强正则化
+                //        AtWA(ii, ii) += reg * 100.0;
+                //    }
+                //    else {
+                //        // 正常对角线：标准正则化
+                //        AtWA(ii, ii) += reg;
+                //    }
+                //}
+
+                //print2Log("Done (reg=%.2e, median=%.2e)\n", reg, diag_median);
+
+                // ===== 求解（使用LDLT）=====
+                print2Log("  Solving system (LDLT)...");
+
+                Eigen::LDLT<MatrixXd> ldlt(AtWA);
+
+                //if (ldlt.info() != Eigen::Success) {
+                //    print2Log("FAILED!\n");
+
+                //    // 强正则化重试
+                //    print2Log("  Retrying with stronger regularization...\n");
+                //    for (int ii = 0; ii < n; ii++) {
+                //        AtWA(ii, ii) += diag_median * 0.01;
+                //    }
+
+                //    ldlt.compute(AtWA);
+                //    if (ldlt.info() != Eigen::Success) {
+                //        print2Log("ERROR: Decomposition still failed!\n");
+                //        break;
+                //    }
+                //}
+
+                x = ldlt.solve(AtWb);
+
+                if (ldlt.info() != Eigen::Success) {
+                    print2Log("FAILED!\n");
+                    break;
+                }
+
+                print2Log("Done\n");
+                // ===== 检查解的合理性 =====
+                double x_min = x.minCoeff();
+                double x_max = x.maxCoeff();
+                int nan_count = 0, inf_count = 0, large_count = 0;
+
+                for (int ii = 0; ii < n; ii++) {
+                    if (std::isnan(x(ii))) nan_count++;
+                    else if (std::isinf(x(ii))) inf_count++;
+                    else if (fabs(x(ii)) > 1e6) large_count++;
+                }
+
+                print2Log("  Solution range: [%.4f, %.4f]\n", x_min, x_max);
+                if (nan_count > 0) print2Log("  ERROR: %d NaN values!\n", nan_count);
+                if (inf_count > 0) print2Log("  ERROR: %d Inf values!\n", inf_count);
+                if (large_count > 0) print2Log("  WARNING: %d abnormally large values (>1e6)!\n", large_count);
+
+                // ===== 计算残差 =====
+                print2Log("  Computing residuals...");
+
+                std::vector<double> abs_residuals;
+                abs_residuals.reserve(total_obs);
+
+                double vv_sum = 0.0;
+                int valid_count = 0;
+                global_obs_id = 0;
+
+                for (i = 0; i < sum; i++) {
+                    char str[512], strT[256], strSrc[256], strRef[256], strOlp[512];
+                    int idx, idxr;
+
+                    m_listCtrl.GetItemText(i, 0, str, 256);
+                    sprintf(strT, "%s%s.tsk", strRom, strrchr(str, '\\'));
+
+                    FILE* fTsk = fopen(strT, "rt");
+                    if (!fTsk) continue;
+
+                    fgets(str, 512, fTsk);
+                    sscanf(str, "%s", strSrc);
+                    DOS_PATH(strSrc);
+
+                    fgets(str, 512, fTsk);
+                    sscanf(str, "%d", &idx);
+
+                    if (!m_strLasDir.IsEmpty()) {
+                        fgets(str, 512, fTsk);
+                    }
+
+                    while (!feof(fTsk)) {
+                        if (!fgets(str, 512, fTsk)) break;
+                        sscanf(str, "%s", strRef);
+                        DOS_PATH(strRef);
+
+                        if (!fgets(str, 512, fTsk)) break;
+                        sscanf(str, "%d", &idxr);
+
+                        strcpy(strOlp, strT);
+                        strcpy(strrchr(strOlp, '.'), "_");
+                        strcat(strOlp, strrchr(strRef, '\\') + 1);
+                        strcat(strOlp, ".olp");
+
+                        COlpFile olpF;
+                        if (!olpF.Load4File(strOlp)) continue;
+
+                        int oz;
+                        OBV* pOs = olpF.GetData(&oz);
+
+                        for (int v = 0; v < oz; v++, pOs++) {
+                            double k1 = getKval(1, pOs->csz, pOs->cvz, pOs->cas)/* - pAK1[idx];*/;
+                            double k2 = getKval(4, pOs->csz, pOs->cvz, pOs->cas)/* - pAK2[idx];*/;
+                            double cv = pOs->cv[c]/* / DN_SCALE*/;
+                            double rv = pOs->rv[c]/* / DN_SCALE*/;
+
+                            double k1r, k2r;
+                            if (idxr == -1) {
+                                k1r = 0;
+                                k2r = 0;
+                            }
+                            else {
+                                k1r = getKval(1, pOs->rsz, pOs->rvz, pOs->ras)/* - pAK1[idxr]*/;
+                                k2r = getKval(4, pOs->rsz, pOs->rvz, pOs->ras) /*- pAK2[idxr]*/;
+                            }
+
+                            double w = obs_weights[global_obs_id];
+
+                            if (w >= 0.001) {
+                                double residual;
+                                if (idxr == -1) {
+                                    double computed = -x(idx * 4) - k1 * x(idx * 4 + 1) - k2 * x(idx * 4 + 2) + cv * x(idx * 4 + 3);
+                                    residual = computed - rv;
+                        }
+                                else {
+                                    double val_idx = x(idx * 4) + k1 * x(idx * 4 + 1) + k2 * x(idx * 4 + 2) - cv * x(idx * 4 + 3);
+                                    double val_idxr = x(idxr * 4) + k1r * x(idxr * 4 + 1) + k2r * x(idxr * 4 + 2) - rv * x(idxr * 4 + 3);
+                                    residual = val_idx - val_idxr;
+                    }
+
+                                vv_sum += residual * residual * w;
+                                valid_count++;
+                                abs_residuals.push_back(fabs(residual));
+                            }
+
+                            global_obs_id++;
+                        }
+                    }
+                    fclose(fTsk);
+                }
+
+                std::sort(abs_residuals.begin(), abs_residuals.end());
+                sigma0 = abs_residuals[abs_residuals.size() / 2] * 1.4826;
+                double rmse = sqrt(vv_sum / valid_count);
+
+                print2Log("Done\n");
+                print2Log("  Statistics (normalized): sigma0=%.4f, RMSE=%.4f\n", sigma0, rmse);
+                //print2Log("  Statistics (DN units): sigma0=%.1f, RMSE=%.1f\n",
+                //    sigma0* DN_SCALE, rmse* DN_SCALE);
+
+                if (iter == max_iterations - 1) {
+                    break;
+                }
+
+                // ===== 更新权重 =====
+                print2Log("  Updating weights...");
+
+                int outlier_count = 0;
+                for (size_t oid = 0; oid < abs_residuals.size(); oid++) {
+                    double std_res = abs_residuals[oid] / (sigma0 + 1e-10);
+                    double new_w = IGG3Weight(std_res, obs_init_weights[oid]);
+
+                    if (new_w < obs_weights[oid] * 0.8) {
+                        outlier_count++;
+                }
+
+                    obs_weights[oid] = new_w;
+                }
+
+                print2Log("Done (outliers=%d, %.1f%%)\n",
+                    outlier_count, 100.0 * outlier_count / abs_residuals.size());
+                print2Log("  Time: %.2fs\n", (GetTickCount() - iter_st) * 0.001);
+
+                ProgStep(cancel);
+            }
+
+            // ===== 输出结果 =====
+            sprintf(str, "%s//pre_bnd%d.txt", strRom, c + 1);
+            FILE* fKnl = fopen(str, "wt");
+            if (fKnl) {
+                for (i = 0; i < sum; i++) {
+                    m_listCtrl.GetItemText(i, 0, str, 256);
+                    fprintf(fKnl, "%9.6lf \t %15.6lf \t %15.6lf \t %15.6lf \t %s\n",
+                        x(i * 4 + 3), x(i * 4), x(i * 4 + 1), x(i * 4 + 2),
+                        strrchr(str, '\\'));
+                }
+                fclose(fKnl);
+            }
+
+            print2Log("Band %d done. Total: %.2fs\n\n",
+                c + 1, (GetTickCount() - st) * 0.001);
+        }
+
+        //delete[]pAK1;
+
+        ProgEnd();
+        print2Log("RadBA completed.\n");
+    }
+
+   	if (m_hW4EndHdl) ::SetEvent( m_hW4EndHdl );
+    if (m_hEThEHdl ) ::CloseHandle(m_hEThEHdl); m_hEThEHdl = NULL;
+	::CloseHandle( m_hThread ); m_hThread = NULL;
+    
+    PostMessage( WM_OUTPUT_MSG,THREADEND,0 );
+}
+
+void CRadCaliDlg::OnTaskOver( UINT tskId )
+{
+    int tskSum = m_listCtrl.GetItemCount();
+    for ( int i=0;i<tskSum;i++ ){
+        if ( int(tskId)==atoi(m_listCtrl.GetItemText(i,TSK_ID)) ){
+            m_listCtrl.SetItemText( i,TSK_STA,TSK_STA_OVER );
+        }
+    } 
+}
+
+void CRadCaliDlg::OnTaskTerm( UINT tskGrpId,UINT tskId )
+{
+    int tskSum = m_listCtrl.GetItemCount();
+    for ( int i=0;i<tskSum;i++ ){
+        if ( int(tskGrpId)==atoi(m_listCtrl.GetItemText(i,TSK_GRP)) && 
+            int(tskId)==atoi(m_listCtrl.GetItemText(i,TSK_ID)) ){
+            m_listCtrl.SetItemText( i,TSK_STA,TSK_STA_TERM );
+        }
+    }       
+}
+
+void CRadCaliDlg::OnTaskExit( UINT tskGrpId,UINT tskId )
+{
+    int tskSum = m_listCtrl.GetItemCount();
+    for ( int i=0;i<tskSum;i++ ){
+        if ( int(tskGrpId)==atoi(m_listCtrl.GetItemText(i,TSK_GRP)) && 
+            int(tskId)==atoi(m_listCtrl.GetItemText(i,TSK_ID)) ){
+            
+            cprintf( "\n\n========================== %s\n",m_listCtrl.GetItemText(i,TSK_STA) );
+            if ( m_listCtrl.GetItemText(i,TSK_STA)!=TSK_STA_OVER )            
+                m_listCtrl.SetItemText( i,TSK_STA,TSK_STA_EXIT );
+        }
+    }               
+}
+
+
+
+/*======================================================================
+ *  TIFF 影像仿射变换封装与匹配实现
+ *
+ *  坐标约定（GDAL GeoTransform 6参数，像元左上角坐标）：
+ *    gt[0]  = 左上角像元左上角 X（经度或 UTM Easting）
+ *    gt[1]  = 每列的 X 增量（正数）
+ *    gt[2]  = 行旋转项（通常为 0）
+ *    gt[3]  = 左上角像元左上角 Y（纬度或 UTM Northing）
+ *    gt[4]  = 列旋转项（通常为 0）
+ *    gt[5]  = 每行的 Y 增量（正北向影像为负数）
+ *
+ *  像元中心坐标（与原 tfw 约定一致，因此公式等价）：
+ *    X(col,row) = (gt[0]+gt[1]*0.5) + gt[1]*col + gt[2]*row
+ *    Y(col,row) = (gt[3]+gt[5]*0.5) + gt[4]*col + gt[5]*row
+ *  即 Ex = gt[0]+gt[1]*0.5，Dx = gt[1]，Ry = gt[2]
+ *     Ny = gt[3]+gt[5]*0.5，Rx = gt[4]，Dy = gt[5]
+ *
+ *  逆变换（地理→像素中心）：
+ *    det = Dx*Dy - Ry*Rx
+ *    col = ( Dy*(X-Ex) - Ry*(Y-Ny) ) / det
+ *    row = ( Dx*(Y-Ny) - Rx*(X-Ex) ) / det
+ *
+ *  内存布局：BIP，uint16，行 0 = 影像顶行，与 GDAL RasterIO 一致。
+ *  OLP 坐标：直接存顶→下像素坐标，row=0 = 影像顶行，不翻转。
+ *======================================================================*/
+
+ /*----------------------------------------------------------------------
+  *  CTifAffine：单幅 TIFF 的仿射参数 + 整幅影像内存数据
+  *  影像读取完全由 GDAL 完成，支持任意波段数和位深的 GeoTIFF。
+  *----------------------------------------------------------------------*/
 struct CTifAffine
 {
     // 仿射参数（像元中心坐标系，与原 tfw 约定兼容）
@@ -925,1019 +1695,6 @@ struct CTifAffine
         return Sample(fc, fr, gs, out);
     }
 };
-
-void CRadCaliDlg::Process()
-{
-    gs_hWnd = m_hWnd;
-	m_hEThEHdl = ::CreateEvent( NULL,TRUE,FALSE,itostr( LONG(this) ) );
-    
-    CTime stTm; SYSTEM_INFO sysInfo; GetSystemInfo (&sysInfo);   
-    if (sysInfo.dwNumberOfProcessors>MAX_CPU) sysInfo.dwNumberOfProcessors=MAX_CPU;
-    BOOL bRun = FALSE; int maxTm=120,cpuSum = atoi( m_strMxCore ); 
-    if (cpuSum<1) cpuSum = 1;  if (cpuSum>sysInfo.dwNumberOfProcessors-1) cpuSum = sysInfo.dwNumberOfProcessors-1;
-    char strCmd[1024],strExe[256]; ::GetModuleFileName(NULL,strExe,sizeof(strExe));
-
-    m_strMxCore.Format("%d",cpuSum );
-    AfxGetApp()->WriteProfileString( "CRadCaliDlg","CPUs",m_strMxCore );  
-
-    char *pS,strDir[256],strT[256],str[512];
-    strcpy( strDir,m_strRet ); pS = strrchr( strDir,'\\' ); if (pS) *pS=0;
-    
-    char strRom[256]; sprintf( strRom,"%s\\ROM_S2Bexp",strDir );
-    CreateDir( strRom );
-
-    char strLog[256]; strcpy( strLog,m_strRet );
-    sprintf( str,"%s-s2b.log",strLog ); 
-    ::DeleteFile(str);  openLog(str);  
-
-    int i,j,c,b,sum = m_listCtrl.GetItemCount();
-    ///////////////////////////////////    
-    struct RI{
-        int idx;
-        float area;
-    }; RI iRi,*pRi = new RI[sum+8];
-    struct RGN{
-        double x[8];
-        double y[8];
-        int sz;
-    }; RGN iRg,*pRg = new RGN[sum+8];
-    memset( pRg,0,sizeof(RGN)*sum );
-    IMGPAR imgPar; CTMGeom cc; 
-    double xs,ys,zs,phi,omg,kap,grdZ;
-    sprintf( strT,"%s\\imgPar.dpi",strDir ); DOS_PATH(strT); 
-    CTMVziFile vziFile; vziFile.Load4File(strT); 
-    for( i=0;i<sum;i++ ){
-        m_listCtrl.GetItemText(i,1,str,256);
-        imgPar = vziFile.m_imgPar;
-        sscanf( str,"%lf%lf%lf%lf%lf%lf%lf",&xs,&ys,&zs,&phi,&omg,&kap,&grdZ );        
-        imgPar.aopX = xs; imgPar.aopY = ys; imgPar.aopZ = zs;
-        imgPar.aopP = phi;imgPar.aopO = omg;imgPar.aopK = kap;
-        cc.Init( &imgPar ); pRg[i].sz = 4;
-        cc.GetGrdPrjRgn( imgPar.iopX*2,imgPar.iopY*2,grdZ,pRg[i].x,pRg[i].y );
-    }
-
-    // ── LAS 目录（写入任务文件供 MchTie 使用）──────────────────────
-    char strLasDir[512] = {};
-    if (!m_strLasDir.IsEmpty())
-        strcpy(strLasDir, (LPCSTR)m_strLasDir);
-
-    if (m_bTie) print2Log( "MchTie start...\n" );
-    ///////////////////////////////////    
-    ProgBegin(sum); int cancel;
-    for( i=0;i<sum;i++,ProgStep(cancel) )
-	{
-		if ( ::WaitForSingleObject(m_hEThEHdl,1)==WAIT_OBJECT_0 ) break;
-
-        m_listCtrl.GetItemText(i,0,str,256);  print2Log("process: %s\n",strrchr(str,'\\') );
-        sprintf( strT,"%s%s.tsk",strRom,strrchr(str,'\\') );
-        FILE *fTsk = fopen( strT,"wt" );
-        fprintf( fTsk,"%s\n%d %s %d %d %d\n",str,i,m_listCtrl.GetItemText(i,1),m_gs,m_ws,m_bTxt );
-        // LAS 目录
-        if (strLasDir[0])
-            fprintf(fTsk, "LAS=%s\n", strLasDir);
-
-        fprintf( fTsk,"%s\n%s\n",m_strBas,"-1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 " );
-
-        /////////////////////////////////////////////
-        iRi.area = (float)(GetRgnArea( pRg[i].x,pRg[i].y,pRg[i].sz ));
-        memset( pRi,0,sizeof(RI)*sum );
-        for( j=0;j<sum;j++ ){
-            if ( j==i ) continue;
-            iRg.sz = 0;
-            RgnClip( pRg[i].x,pRg[i].y,pRg[i].sz,
-                pRg[j].x,pRg[j].y,pRg[j].sz,
-                iRg.x,iRg.y,&iRg.sz );
-            if ( iRg.sz>2 ){
-                pRi[j].idx = j;
-                pRi[j].area = (float)(GetRgnArea( iRg.x,iRg.y,iRg.sz ));
-        }
-    }
-        qsort( pRi,sum,sizeof(RI),&comRI );
-        for( j=0;j<sum;j++ ){
-            if ( pRi[j].area/iRi.area<0.01  ) break;
-
-            fprintf( fTsk,"%s\n",m_listCtrl.GetItemText( pRi[j].idx,0 ) );
-            fprintf( fTsk,"%d %s\n",pRi[j].idx,m_listCtrl.GetItemText( pRi[j].idx,1 ) );
-        }
-        /////////////////////////////////////////////
-        fclose( fTsk );
-
-        if (m_bTie){
-#ifdef _DEBUG
-            sprintf(strCmd, "TIE@%s",strT ); 
-            MchTie( strCmd ); 
-            //break;
-#else
-            sprintf(strCmd, "%s TIE@%s",strExe,strT ); 
-            print2Log( "%s\n",strCmd );
-#endif
-
-            bRun = FALSE; 
-            while( !bRun ){
-                for (int c=0;c<cpuSum;c++ ){
-                    if ( gs_hThreadId[c]==NULL ){
-                        strcpy( gs_strCmd[c],strCmd );
-                        HANDLE hThread = ::CreateThread( NULL,0,CupThread_CRadCaliDlg,(void*)gs_strCmd[c],0,gs_hThreadId+c );
-                        ::CloseHandle( hThread ); bRun = TRUE; break;
-                    }
-                    if ( ::WaitForSingleObject(m_hEThEHdl,16)==WAIT_OBJECT_0 ) break;
-                }
-            }
-        }   
-	}
-    delete []pRi;
-    delete []pRg;
-
-    // waiting all process over in maxTm 
-    stTm = CTime::GetCurrentTime();
-    while( 1 ){
-        for ( c=0;c<MAX_CPU;c++ ){ if ( gs_hThreadId[c]!=NULL ) break; }
-        if ( c==MAX_CPU || ::WaitForSingleObject(m_hEThEHdl,128)==WAIT_OBJECT_0 ) break;
-        // Terminate the process
-        CTimeSpan ts = CTime::GetCurrentTime()-stTm;
-        if ( ts.GetTotalMinutes()>maxTm ){
-            for ( int i=0;i<MAX_CPU;i++ ){
-                if ( gs_hProcId[i] ){
-                    HANDLE hProc = ::OpenProcess( PROCESS_TERMINATE,FALSE,gs_hProcId[i] );
-                    if ( hProc ) ::TerminateProcess( hProc,0x22 );
-                    gs_hProcId[i] = 0; Sleep(8);
-                }
-            }
-            break;
-        }
-    }
-    if (m_bTie) print2Log( "MchTie over.\n" );
-    ProgEnd();  
-
-    /////////////////////////////////
-    COlpFile olpF; char strSrc[256],strRef[256],strOlp[512]; int idx,idxr;
-    if (m_bAdj) {
-        print2Log("RadBA start...\n");
-
-        double* pAK1 = new double[sum * 2];
-        double* pAK2 = pAK1 + sum;
-        memset(pAK1, 0, sizeof(double) * sum * 2);
-        for (i = 0; i < sum; i++) {
-            m_listCtrl.GetItemText(i, 0, str, 256);
-            sprintf(strT, "%s%s.tsk_skm.txt", strRom, strrchr(str, '\\'));
-            FILE* fKM = fopen(strT, "rt");
-            fscanf(fKM, "%lf%lf", pAK1 + i, pAK2 + i);   print2Log("%lf %lf\n", pAK1[i], pAK2[i]);
-            fclose(fKM);
-        }
-
-        // 准备任务文件列表
-        char** tskFileList = new char* [sum];
-        for (i = 0; i < sum; i++) {
-            m_listCtrl.GetItemText(i, 0, str, 256);
-            tskFileList[i] = new char[512];
-            sprintf(tskFileList[i], "%s%s.tsk", strRom, strrchr(str, '\\'));
-        }
-        // 创建空间变化平差求解器
-        SpatialRadBA solver;
-        solver.setUseSpatialVarying(m_bUseSpatialVarying);
-        solver.setSmoothWeight(m_smoothWeight);
-        solver.setMaxIterations(5);
-
-        // 为每个波段创建参数数组
-        SpatialRadParams** bandParams = new SpatialRadParams * [4];
-        for (c = 0; c < 4; c++) {
-            bandParams[c] = new SpatialRadParams[sum];
-        }
-
-        // 设置每张影像的尺寸（从影像文件读取）
-        for (i = 0; i < sum; i++) {
-            char imgPath[512] = "";
-            FILE* fT = fopen(tskFileList[i], "rt");
-            if (fT) {
-                fgets(imgPath, 512, fT); // 第一行是影像路径
-                fclose(fT);
-                char* p = strchr(imgPath, '\n'); if (p) *p = 0;
-                p = strchr(imgPath, '\r'); if (p) *p = 0;
-            }
-            if (imgPath[0]) {
-                CTifAffine tmpImg;
-                if (tmpImg.Load(imgPath)) {
-                    for (c = 0; c < 4; c++) {
-                        bandParams[c][i].imgWidth = tmpImg.cols;
-                        bandParams[c][i].imgHeight = tmpImg.rows;
-                    }
-                }
-                else {
-                    // 默认值
-                    for (c = 0; c < 4; c++) {
-                        bandParams[c][i].imgWidth = 7000;
-                        bandParams[c][i].imgHeight = 7000;
-                    }
-                }
-            }
-            else {
-                for (c = 0; c < 4; c++) {
-                    bandParams[c][i].imgWidth = 7000;
-                    bandParams[c][i].imgHeight = 7000;
-                }
-            }
-        }
-
-        ProgBegin(sum * 4);
-        int cancel = 0;
-        // 对每个波段求解
-        for (c = 0; c < 4; c++) {
-            UINT st = GetTickCount();
-            print2Log("\n========== Band %d ==========\n", c + 1);
-
-            print2Log("  Loading tie points from all quality levels...\n");
-
-            // 为此波段的所有参考影像收集匹配点
-            std::vector<const char*> excellentFiles, goodFiles, fairFiles, poorFiles;
-
-            // 从任务文件扫描生成对应的质量文件路径
-            for (i = 0; i < sum; i++) {
-                char str[512], strT[256];
-                m_listCtrl.GetItemText(i, 0, str, 256);
-
-                // 生成该影像对应的质量分级文件路径
-                sprintf(strT, "%s%s.tsk", strRom, strrchr(str, '\\'));
-
-                // 打开任务文件，逐行读参考影像
-                FILE* fTsk = fopen(strT, "rt");
-                if (!fTsk) continue;
-
-                char strLine[512], strSrc[256];
-                int idx;
-
-                // 第1行：源影像
-                if (!fgets(strLine, sizeof(strLine), fTsk)) { fclose(fTsk); continue; }
-                sscanf(strLine, "%s", strSrc);
-
-                // 第2行：影像索引
-                if (!fgets(strLine, sizeof(strLine), fTsk)) { fclose(fTsk); continue; }
-                sscanf(strLine, "%d", &idx);
-
-                // 可能的第3行：LAS 目录（检查并跳过）
-                {
-                    long pos = ftell(fTsk);
-                    if (fgets(strLine, sizeof(strLine), fTsk)) {
-                        char tmp[512] = {};
-                        sscanf(strLine, "%s", tmp);
-                        if (_strnicmp(tmp, "LAS=", 4) != 0 && _strnicmp(tmp, "LAS:", 4) != 0) {
-                            fseek(fTsk, pos, SEEK_SET);  // 回退
-                        }
-                    }
-                }
-
-                // 逐参考影像处理
-                while (!feof(fTsk)) {
-                    if (!fgets(strLine, sizeof(strLine), fTsk)) break;
-                    sscanf(strLine, "%s", strRef);
-                    DOS_PATH(strRef);
-
-                    if (!fgets(strLine, sizeof(strLine), fTsk)) break;
-                    int idxr;
-                    sscanf(strLine, "%d", &idxr);
-
-                    // ✅ 生成质量文件路径（与 CollectOlpList 逻辑完全一致）
-                    char strOlp[512];
-                    strcpy(strOlp, strT);                          // 先用任务文件路径
-                    strcpy(strrchr(strOlp, '.'), "_");             // 把 .tsk 改为 _
-                    strcat(strOlp, strrchr(strRef, '\\') + 1);     // 加参考影像文件名
-                    strcat(strOlp, ".olp");                        // 加 .olp
-
-                    // 生成质量分级文件路径
-                    char strExc[512], strGd[512], strFr[512], strPr[512];
-                    strcpy(strExc, strOlp);
-                    char* p = strrchr(strExc, '.'); if (p) strcpy(p, "_excellent.olp");
-
-                    strcpy(strGd, strOlp);
-                    p = strrchr(strGd, '.'); if (p) strcpy(p, "_good.olp");
-
-                    strcpy(strFr, strOlp);
-                    p = strrchr(strFr, '.'); if (p) strcpy(p, "_fair.olp");
-
-                    strcpy(strPr, strOlp);
-                    p = strrchr(strPr, '.'); if (p) strcpy(p, "_poor.olp");
-
-                    // 将存在的文件加入对应列表
-                    if (IsExist(strExc)) excellentFiles.push_back(_strdup(strExc));
-                    if (IsExist(strGd)) goodFiles.push_back(_strdup(strGd));
-                    if (IsExist(strFr)) fairFiles.push_back(_strdup(strFr));
-                    if (IsExist(strPr)) poorFiles.push_back(_strdup(strPr));
-                }
-                fclose(fTsk);
-            }
-
-            // 统计信息
-            int nEx = 0, nGd = 0, nFr = 0, nPr = 0;
-            for (auto& f : excellentFiles) {
-                COlpFile tmp;
-                if (tmp.Load4File(f)) nEx += tmp.GetSize();
-            }
-            for (auto& f : goodFiles) {
-                COlpFile tmp;
-                if (tmp.Load4File(f)) nGd += tmp.GetSize();
-            }
-            for (auto& f : fairFiles) {
-                COlpFile tmp;
-                if (tmp.Load4File(f)) nFr += tmp.GetSize();
-            }
-            for (auto& f : poorFiles) {
-                COlpFile tmp;
-                if (tmp.Load4File(f)) nPr += tmp.GetSize();
-            }
-
-            print2Log("  Quality distribution: Excellent=%d, Good=%d, Fair=%d, Poor=%d (Total=%d)\n",
-                nEx, nGd, nFr, nPr, nEx + nGd + nFr + nPr);
-
-            print2Log("  Strategy: Merged with quality weights\n");
-            print2Log("    Excellent: 1.0x (最可靠)\n");
-            print2Log("    Good:      0.8x (良好)\n");
-            print2Log("    Fair:      0.5x (一般)\n");
-            print2Log("    Poor:      0.2x (低信任)\n");
-
-            bool success = solver.solveBand(
-                sum, c,
-                (const char**)tskFileList,
-                strRom,
-                bandParams[c],
-                NULL,
-                excellentFiles, goodFiles, fairFiles, poorFiles
-            );
-            for (auto& f : excellentFiles) free((void*)f);
-            for (auto& f : goodFiles) free((void*)f);
-            for (auto& f : fairFiles) free((void*)f);
-            for (auto& f : poorFiles) free((void*)f);
-            if (success) {
-                print2Log("  Converged in %d iterations\n", solver.getIterations());
-                print2Log("  Final RMSE: %.4f\n", solver.getFinalRMSE());
-            }
-            else {
-                print2Log("  ERROR: Band %d adjustment failed!\n", c + 1);
-            }
-
-            UINT et = GetTickCount();
-            print2Log("  Time: %.2f sec\n", (et - st) / 1000.0);
-
-            ProgStep(cancel);
-        }
-
-        ProgEnd();
-
-        // 保存参数（兼容旧格式 + 空间系数）
-        print2Log("\n========== 保存辐射参数 ==========\n");
-        char strBndFile[4][512];
-        sprintf(strBndFile[0], "%s\\pre_bnd1.txt", strRom);
-        sprintf(strBndFile[1], "%s\\pre_bnd2.txt", strRom);
-        sprintf(strBndFile[2], "%s\\pre_bnd3.txt", strRom);
-        sprintf(strBndFile[3], "%s\\pre_bnd4.txt", strRom);
-
-        FILE* fpBnd[4] = { NULL };
-        for (int b = 0; b < 4; b++) {
-            fpBnd[b] = fopen(strBndFile[b], "wt");
-            if (!fpBnd[b])
-                print2Log("ERROR: 无法创建文件 %s\n", strBndFile[b]);
-        }
-
-        for (i = 0; i < sum; i++) {
-            char imageName[256];
-            m_listCtrl.GetItemText(i, 0, str, 256);
-            const char* pName = strrchr(str, '\\');
-            if (pName) pName++; else pName = str;
-            strcpy(imageName, pName);
-
-            for (int b = 0; b < 4; b++) {
-                if (!fpBnd[b]) continue;
-                SpatialRadParams& p = bandParams[b][i];
-
-                // 第1行：全局参数
-                fprintf(fpBnd[b], "%.12f %.12f %.12f %.12f %s\n",
-                    p.s0, p.a00, p.a10, p.a20, imageName);
-
-                if (m_bUseSpatialVarying) {
-                    // 第2行：s的空间系数
-                    fprintf(fpBnd[b], "%.12f %.12f %.12f %.12f %.12f\n",
-                        p.sx, p.sy, p.sxx, p.sxy, p.syy);
-                    // 第3行：a0的空间系数
-                    fprintf(fpBnd[b], "%.12f %.12f %.12f %.12f %.12f\n",
-                        p.a0x, p.a0y, p.a0xx, p.a0xy, p.a0yy);
-                    // 第4行：a1和a2的空间系数
-                    fprintf(fpBnd[b], "%.12f %.12f %.12f %.12f\n",
-                        p.a1x, p.a1y, p.a2x, p.a2y);
-                }
-            }
-        }
-
-        for (int b = 0; b < 4; b++)
-            if (fpBnd[b]) { fclose(fpBnd[b]); print2Log("保存参数文件: %s\n", strBndFile[b]); }
-
-        // 清理
-        for (c = 0; c < 4; c++) delete[] bandParams[c];
-        delete[] bandParams;
-        for (i = 0; i < sum; i++) delete[] tskFileList[i];
-        delete[] tskFileList;
-        delete[] pAK1;
-        //for (c = 0; c < 4; c++) {
-        //    UINT st = GetTickCount();
-        //    print2Log("\n========== Band %d ==========\n", c + 1);
-
-        //    print2Log("Step 1: Counting observations...\n");
-
-        //    int total_obs = 0;
-        //    int baseline_obs = 0;  // 基线约束数量
-        //    int relative_obs = 0;  // 相对约束数量
-        //    int loaded_files = 0;
-        //    std::vector<int> obs_per_image(sum, 0);  // 每张影像的观测值数量
-
-        //    for (i = 0; i < sum; i++) {
-        //        char str[512], strT[256], strSrc[256], strRef[256], strOlp[512];
-        //        int idx, idxr;
-
-        //        m_listCtrl.GetItemText(i, 0, str, 256);
-        //        sprintf(strT, "%s%s.tsk", strRom, strrchr(str, '\\'));
-
-        //        FILE* fTsk = fopen(strT, "rt");
-        //        if (!fTsk) continue;
-
-        //        fgets(str, 512, fTsk);
-        //        sscanf(str, "%s", strSrc);
-        //        DOS_PATH(strSrc);
-
-        //        fgets(str, 512, fTsk);
-        //        sscanf(str, "%d", &idx);
-
-        //        if (!m_strLasDir.IsEmpty()) {
-        //            fgets(str, 512, fTsk);
-        //        }
-
-        //        while (!feof(fTsk)) {
-        //            if (!fgets(str, 512, fTsk)) break;
-        //            sscanf(str, "%s", strRef);
-        //            DOS_PATH(strRef);
-
-        //            if (!fgets(str, 512, fTsk)) break;
-        //            sscanf(str, "%d", &idxr);
-
-        //            strcpy(strOlp, strT);
-        //            strcpy(strrchr(strOlp, '.'), "_");
-        //            strcat(strOlp, strrchr(strRef, '\\') + 1);
-        //            strcat(strOlp, ".olp");
-
-        //            COlpFile olpF;
-        //            if (olpF.Load4File(strOlp)) {
-        //                int oz;
-        //                olpF.GetData(&oz);
-        //                total_obs += oz;
-        //                obs_per_image[idx] += oz;
-
-        //                if (idxr == -1) {
-        //                    baseline_obs += oz;
-        //        }
-        //                else {
-        //                    relative_obs += oz;
-        //                    obs_per_image[idxr] += oz;
-        //                }
-
-        //                loaded_files++;
-        //            }
-        //        }
-        //        fclose(fTsk);
-        //    }
-
-        //    print2Log("Total observations: %d (from %d files)\n", total_obs, loaded_files);
-        //    print2Log("  Baseline constraints: %d\n", baseline_obs);
-        //    print2Log("  Relative constraints: %d\n", relative_obs);
-
-        //    // 检查孤立影像
-        //    int isolated_images = 0;
-        //    for (i = 0; i < sum; i++) {
-        //        if (obs_per_image[i] == 0) {
-        //            isolated_images++;
-        //            print2Log("  WARNING: Image %d has NO observations!\n", i);
-        //        }
-        //    }
-        //    if (isolated_images > 0) {
-        //        print2Log("  WARNING: %d isolated images found! These will cause singularity.\n", isolated_images);
-        //    }
-
-        //    if (total_obs == 0) {
-        //        print2Log("ERROR: No observations! Check if .olp files exist.\n");
-        //        continue;
-        //    }
-
-        //    // ===== 迭代平差 =====
-        //    int max_iterations = 3;
-        //    double sigma0 = 1.0;
-
-        //    VectorXd x = VectorXd::Zero(n);
-
-        //    std::vector<double> obs_weights(total_obs, 1.0);
-        //    std::vector<double> obs_init_weights(total_obs, 1.0);
-
-        //    for (int iter = 0; iter < max_iterations; iter++) {
-        //        print2Log("\n--- Iteration %d ---\n", iter + 1);
-        //        UINT iter_st = GetTickCount();
-
-        //        print2Log("  Building equations (streaming)...");
-
-        //        MatrixXd AtWA = MatrixXd::Zero(n, n);
-        //        VectorXd AtWb = VectorXd::Zero(n);
-
-        //        int global_obs_id = 0;
-        //        int processed_obs = 0;
-
-        //        for (i = 0; i < sum; i++) {
-        //            char str[512], strT[256], strSrc[256], strRef[256], strOlp[512];
-        //            int idx, idxr;
-
-        //            m_listCtrl.GetItemText(i, 0, str, 256);
-        //            sprintf(strT, "%s%s.tsk", strRom, strrchr(str, '\\'));
-
-        //            FILE* fTsk = fopen(strT, "rt");
-        //            if (!fTsk) continue;
-
-        //            fgets(str, 512, fTsk);
-        //            sscanf(str, "%s", strSrc);
-        //            DOS_PATH(strSrc);
-
-        //            fgets(str, 512, fTsk);
-        //            sscanf(str, "%d", &idx);
-
-        //            if (!m_strLasDir.IsEmpty()) {
-        //                fgets(str, 512, fTsk);
-        //            }
-        //            while (!feof(fTsk)) {
-        //                if (!fgets(str, 512, fTsk)) break;
-        //                sscanf(str, "%s", strRef);
-        //                DOS_PATH(strRef);
-
-        //                if (!fgets(str, 512, fTsk)) break;
-        //                sscanf(str, "%d", &idxr);
-
-        //                strcpy(strOlp, strT);
-        //                strcpy(strrchr(strOlp, '.'), "_");
-        //                strcat(strOlp, strrchr(strRef, '\\') + 1);
-        //                strcat(strOlp, ".olp");
-
-        //                COlpFile olpF;
-        //                if (!olpF.Load4File(strOlp)) continue;
-
-        //                int oz;
-        //                OBV* pOs = olpF.GetData(&oz);
-
-        //                for (int v = 0; v < oz; v++, pOs++) {
-        //                    double k1 = getKval(1, pOs->csz, pOs->cvz, pOs->cas)/* - pAK1[idx]*/;
-        //                    double k2 = getKval(4, pOs->csz, pOs->cvz, pOs->cas)/* - pAK2[idx]*/;
-        //                    double cv = pOs->cv[c]/* / DN_SCALE*/;
-        //                    double rv = pOs->rv[c]/* / DN_SCALE*/;
-
-        //                    double k1r, k2r, init_w;
-        //                    if (idxr == -1) {
-        //                        init_w = 1.0;
-        //                        k1r = 0;
-        //                        k2r = 0;
-        //                    }
-        //                    else {
-        //                        init_w = 0.1;
-        //                        k1r = getKval(1, pOs->rsz, pOs->rvz, pOs->ras)/* - pAK1[idxr]*/;
-        //                        k2r = getKval(4, pOs->rsz, pOs->rvz, pOs->ras) /*- pAK2[idxr]*/;
-        //                    }
-
-        //                    if (iter == 0) {
-        //                        obs_init_weights[global_obs_id] = init_w;
-        //                        obs_weights[global_obs_id] = init_w;
-        //                    }
-
-        //                    double w = obs_weights[global_obs_id];
-        //                    global_obs_id++;
-
-        //                    if (w < 0.001) continue;
-
-        //                    if (idxr == -1) {
-        //                        // 基线约束: -x0 - k1*x1 - k2*x2 + cv*x3 = rv
-        //                        double a[4] = { 1.0, k1, k2, -cv };
-        //                        double l = -rv;
-
-        //                        int base_idx = idx * 4;
-
-        //                        // 累加到法方程（4x4块）
-        //                        for (int ii = 0; ii < 4; ii++) {
-        //                            int row = base_idx + ii;
-        //                            AtWb(row) += w * a[ii] * l;
-
-        //                            for (int jj = 0; jj < 4; jj++) {
-        //                                int col = base_idx + jj;
-        //                                AtWA(row, col) += w * a[ii] * a[jj];
-        //                        }
-        //                    }
-        //                    }
-        //                    else {
-        //                        // 相对约束：同名点校正后反射率相等
-        //                        // val_i = a0_i + k1_i*a1_i + k2_i*a2_i - cv*s_i
-        //                        // val_j = a0_j + k1j*a1_j + k2j*a2_j - rv*s_j
-        //                        // 约束：val_i - val_j = 0
-        //                        // 偏导（系数向量）与 val 定义一致
-        //                        double a_idx[4] = { 1.0,  k1,   k2,  0.0 };
-        //                        double a_idxr[4] = { -1.0, -k1r, -k2r,  0.0 };
-        //                        double l = cv - rv;
-
-        //                        int base_idx = idx * 4;
-        //                        int base_idxr = idxr * 4;
-
-        //                        // 当前影像块（4x4）
-        //                        for (int ii = 0; ii < 4; ii++) {
-        //                            int row = base_idx + ii;
-        //                            AtWb(row) += w * a_idx[ii] * l;
-
-        //                            for (int jj = 0; jj < 4; jj++) {
-        //                                int col = base_idx + jj;
-        //                                AtWA(row, col) += w * a_idx[ii] * a_idx[jj];
-        //                            }
-        //                        }
-
-        //                        // 参考影像块（4x4）
-        //                        for (int ii = 0; ii < 4; ii++) {
-        //                            int row = base_idxr + ii;
-        //                            AtWb(row) += w * a_idxr[ii] * l;
-
-        //                            for (int jj = 0; jj < 4; jj++) {
-        //                                int col = base_idxr + jj;
-        //                                AtWA(row, col) += w * a_idxr[ii] * a_idxr[jj];
-        //                    }
-        //                }
-
-        //                        // 交叉块（4x4 x 2）
-        //                        for (int ii = 0; ii < 4; ii++) {
-        //                            for (int jj = 0; jj < 4; jj++) {
-        //                                int row1 = base_idx + ii;
-        //                                int col1 = base_idxr + jj;
-        //                                AtWA(row1, col1) += w * a_idx[ii] * a_idxr[jj];
-
-        //                                int row2 = base_idxr + ii;
-        //                                int col2 = base_idx + jj;
-        //                                AtWA(row2, col2) += w * a_idxr[ii] * a_idx[jj];
-        //            }
-        //                        }
-        //                    }
-
-        //                    processed_obs++;
-        //                }
-        //            }
-        //            fclose(fTsk);
-        //        }
-
-        //        print2Log("Done (%d obs)\n", processed_obs);
-
-        //        // ===== 诊断法方程 =====
-        //        print2Log("  Diagnosing normal equations...\n");
-
-        //        // 检查对角线元素
-        //        double diag_min = 1e100, diag_max = -1e100, diag_sum = 0.0;
-        //        int zero_diag = 0, small_diag = 0, diag_count = 0;
-
-        //        for (int ii = 0; ii < n; ii++) {
-        //            double d = AtWA(ii, ii);
-
-        //            if (fabs(d) < 1e-15) {
-        //                zero_diag++;
-        //            }
-        //            else if (fabs(d) < 1e-6) {
-        //                small_diag++;
-        //        }
-
-        //            if (d > 1e-15) {
-        //                if (d < diag_min) diag_min = d;
-        //                if (d > diag_max) diag_max = d;
-        //                diag_sum += d;
-        //                diag_count++;
-        //        }
-        //        }
-
-        //        double diag_avg = (diag_count > 0) ? (diag_sum / diag_count) : 1.0;
-        //        double condition_est = (diag_min > 0) ? (diag_max / diag_min) : 1e20;
-
-        //        print2Log("    Diagonal: min=%.2e, max=%.2e, avg=%.2e\n",
-        //            diag_min, diag_max, diag_avg);
-        //        print2Log("    Condition estimate: %.2e\n", condition_est);
-        //        print2Log("    Zero diagonals: %d, Small diagonals: %d\n",
-        //            zero_diag, small_diag);
-
-        //        if (zero_diag > 0) {
-        //            print2Log("    ERROR: %d zero diagonal elements! Check for isolated images.\n", zero_diag);
-        //        }
-
-        //        if (condition_est > 1e12) {
-        //            print2Log("    WARNING: Matrix is very ill-conditioned!\n");
-        //        }
-
-        //        // 检查对称性
-        //        double sym_error = 0.0;
-        //        for (int ii = 0; ii < n; ii++) {
-        //            for (int jj = ii + 1; jj < n; jj++) {
-        //                sym_error += fabs(AtWA(ii, jj) - AtWA(jj, ii));
-        //            }
-        //        }
-        //        print2Log("    Symmetry error: %.2e\n", sym_error);
-        //        // ===== 添加正则化 =====
-        //        //print2Log("  Adding regularization...");
-
-        //        //std::vector<double> valid_diags;
-        //        //for (int ii = 0; ii < n; ii++) {
-        //        //    double d = AtWA(ii, ii);
-        //        //    if (d > 1e-15) {
-        //        //        valid_diags.push_back(d);
-        //        //    }
-        //        //}
-
-        //        //double diag_median = 1.0;
-        //        //if (!valid_diags.empty()) {
-        //        //    std::sort(valid_diags.begin(), valid_diags.end());
-        //        //    diag_median = valid_diags[valid_diags.size() / 2];
-        //        //}
-
-        //        //// 自适应正则化：基于中位数
-        //        //double reg = diag_median * 1e-6;
-
-        //        //// 特殊处理：对零或极小的对角元素
-        //        //for (int ii = 0; ii < n; ii++) {
-        //        //    double d = AtWA(ii, ii);
-
-        //        //    if (fabs(d) < 1e-15) {
-        //        //        // 零对角线：给一个基准正则化
-        //        //        AtWA(ii, ii) = diag_median * 0.01;
-        //        //    }
-        //        //    else if (d < diag_median * 0.01) {
-        //        //        // 极小对角线：强正则化
-        //        //        AtWA(ii, ii) += reg * 100.0;
-        //        //    }
-        //        //    else {
-        //        //        // 正常对角线：标准正则化
-        //        //        AtWA(ii, ii) += reg;
-        //        //    }
-        //        //}
-
-        //        //print2Log("Done (reg=%.2e, median=%.2e)\n", reg, diag_median);
-
-        //        // ===== 求解（使用LDLT）=====
-        //        print2Log("  Solving system (LDLT)...");
-
-        //        Eigen::LDLT<MatrixXd> ldlt(AtWA);
-
-        //        //if (ldlt.info() != Eigen::Success) {
-        //        //    print2Log("FAILED!\n");
-
-        //        //    // 强正则化重试
-        //        //    print2Log("  Retrying with stronger regularization...\n");
-        //        //    for (int ii = 0; ii < n; ii++) {
-        //        //        AtWA(ii, ii) += diag_median * 0.01;
-        //        //    }
-
-        //        //    ldlt.compute(AtWA);
-        //        //    if (ldlt.info() != Eigen::Success) {
-        //        //        print2Log("ERROR: Decomposition still failed!\n");
-        //        //        break;
-        //        //    }
-        //        //}
-
-        //        x = ldlt.solve(AtWb);
-
-        //        if (ldlt.info() != Eigen::Success) {
-        //            print2Log("FAILED!\n");
-        //            break;
-        //        }
-
-        //        print2Log("Done\n");
-        //        // ===== 检查解的合理性 =====
-        //        double x_min = x.minCoeff();
-        //        double x_max = x.maxCoeff();
-        //        int nan_count = 0, inf_count = 0, large_count = 0;
-
-        //        for (int ii = 0; ii < n; ii++) {
-        //            if (std::isnan(x(ii))) nan_count++;
-        //            else if (std::isinf(x(ii))) inf_count++;
-        //            else if (fabs(x(ii)) > 1e6) large_count++;
-        //        }
-
-        //        print2Log("  Solution range: [%.4f, %.4f]\n", x_min, x_max);
-        //        if (nan_count > 0) print2Log("  ERROR: %d NaN values!\n", nan_count);
-        //        if (inf_count > 0) print2Log("  ERROR: %d Inf values!\n", inf_count);
-        //        if (large_count > 0) print2Log("  WARNING: %d abnormally large values (>1e6)!\n", large_count);
-
-        //        // ===== 计算残差 =====
-        //        print2Log("  Computing residuals...");
-
-        //        std::vector<double> abs_residuals;
-        //        abs_residuals.reserve(total_obs);
-
-        //        double vv_sum = 0.0;
-        //        int valid_count = 0;
-        //        global_obs_id = 0;
-
-        //        for (i = 0; i < sum; i++) {
-        //            char str[512], strT[256], strSrc[256], strRef[256], strOlp[512];
-        //            int idx, idxr;
-
-        //            m_listCtrl.GetItemText(i, 0, str, 256);
-        //            sprintf(strT, "%s%s.tsk", strRom, strrchr(str, '\\'));
-
-        //            FILE* fTsk = fopen(strT, "rt");
-        //            if (!fTsk) continue;
-
-        //            fgets(str, 512, fTsk);
-        //            sscanf(str, "%s", strSrc);
-        //            DOS_PATH(strSrc);
-
-        //            fgets(str, 512, fTsk);
-        //            sscanf(str, "%d", &idx);
-
-        //            if (!m_strLasDir.IsEmpty()) {
-        //                fgets(str, 512, fTsk);
-        //            }
-
-        //            while (!feof(fTsk)) {
-        //                if (!fgets(str, 512, fTsk)) break;
-        //                sscanf(str, "%s", strRef);
-        //                DOS_PATH(strRef);
-
-        //                if (!fgets(str, 512, fTsk)) break;
-        //                sscanf(str, "%d", &idxr);
-
-        //                strcpy(strOlp, strT);
-        //                strcpy(strrchr(strOlp, '.'), "_");
-        //                strcat(strOlp, strrchr(strRef, '\\') + 1);
-        //                strcat(strOlp, ".olp");
-
-        //                COlpFile olpF;
-        //                if (!olpF.Load4File(strOlp)) continue;
-
-        //                int oz;
-        //                OBV* pOs = olpF.GetData(&oz);
-
-        //                for (int v = 0; v < oz; v++, pOs++) {
-        //                    double k1 = getKval(1, pOs->csz, pOs->cvz, pOs->cas)/* - pAK1[idx];*/;
-        //                    double k2 = getKval(4, pOs->csz, pOs->cvz, pOs->cas)/* - pAK2[idx];*/;
-        //                    double cv = pOs->cv[c]/* / DN_SCALE*/;
-        //                    double rv = pOs->rv[c]/* / DN_SCALE*/;
-
-        //                    double k1r, k2r;
-        //                    if (idxr == -1) {
-        //                        k1r = 0;
-        //                        k2r = 0;
-        //                    }
-        //                    else {
-        //                        k1r = getKval(1, pOs->rsz, pOs->rvz, pOs->ras)/* - pAK1[idxr]*/;
-        //                        k2r = getKval(4, pOs->rsz, pOs->rvz, pOs->ras) /*- pAK2[idxr]*/;
-        //                    }
-
-        //                    double w = obs_weights[global_obs_id];
-
-        //                    if (w >= 0.001) {
-        //                        double residual;
-        //                        if (idxr == -1) {
-        //                            double computed = -x(idx * 4) - k1 * x(idx * 4 + 1) - k2 * x(idx * 4 + 2) + cv * x(idx * 4 + 3);
-        //                            residual = computed - rv;
-        //                }
-        //                        else {
-        //                            double val_idx = x(idx * 4) + k1 * x(idx * 4 + 1) + k2 * x(idx * 4 + 2) - cv * x(idx * 4 + 3);
-        //                            double val_idxr = x(idxr * 4) + k1r * x(idxr * 4 + 1) + k2r * x(idxr * 4 + 2) - rv * x(idxr * 4 + 3);
-        //                            residual = val_idx - val_idxr;
-        //            }
-
-        //                        vv_sum += residual * residual * w;
-        //                        valid_count++;
-        //                        abs_residuals.push_back(fabs(residual));
-        //                    }
-
-        //                    global_obs_id++;
-        //                }
-        //            }
-        //            fclose(fTsk);
-        //        }
-
-        //        std::sort(abs_residuals.begin(), abs_residuals.end());
-        //        sigma0 = abs_residuals[abs_residuals.size() / 2] * 1.4826;
-        //        double rmse = sqrt(vv_sum / valid_count);
-
-        //        print2Log("Done\n");
-        //        print2Log("  Statistics (normalized): sigma0=%.4f, RMSE=%.4f\n", sigma0, rmse);
-        //        //print2Log("  Statistics (DN units): sigma0=%.1f, RMSE=%.1f\n",
-        //        //    sigma0* DN_SCALE, rmse* DN_SCALE);
-
-        //        if (iter == max_iterations - 1) {
-        //            break;
-        //        }
-
-        //        // ===== 更新权重 =====
-        //        print2Log("  Updating weights...");
-
-        //        int outlier_count = 0;
-        //        for (size_t oid = 0; oid < abs_residuals.size(); oid++) {
-        //            double std_res = abs_residuals[oid] / (sigma0 + 1e-10);
-        //            double new_w = IGG3Weight(std_res, obs_init_weights[oid]);
-
-        //            if (new_w < obs_weights[oid] * 0.8) {
-        //                outlier_count++;
-        //        }
-
-        //            obs_weights[oid] = new_w;
-        //        }
-
-        //        print2Log("Done (outliers=%d, %.1f%%)\n",
-        //            outlier_count, 100.0 * outlier_count / abs_residuals.size());
-        //        print2Log("  Time: %.2fs\n", (GetTickCount() - iter_st) * 0.001);
-
-        //        ProgStep(cancel);
-        //    }
-
-        //    // ===== 输出结果 =====
-        //    sprintf(str, "%s//pre_bnd%d.txt", strRom, c + 1);
-        //    FILE* fKnl = fopen(str, "wt");
-        //    if (fKnl) {
-        //        for (i = 0; i < sum; i++) {
-        //            m_listCtrl.GetItemText(i, 0, str, 256);
-        //            fprintf(fKnl, "%9.6lf \t %15.6lf \t %15.6lf \t %15.6lf \t %s\n",
-        //                x(i * 4 + 3), x(i * 4), x(i * 4 + 1), x(i * 4 + 2),
-        //                strrchr(str, '\\'));
-        //        }
-        //        fclose(fKnl);
-        //    }
-
-        //    print2Log("Band %d done. Total: %.2fs\n\n",
-        //        c + 1, (GetTickCount() - st) * 0.001);
-        //}
-
-
-        //ProgEnd();
-        print2Log("RadBA completed.\n");
-    }
-
-   	if (m_hW4EndHdl) ::SetEvent( m_hW4EndHdl );
-    if (m_hEThEHdl ) ::CloseHandle(m_hEThEHdl); m_hEThEHdl = NULL;
-	::CloseHandle( m_hThread ); m_hThread = NULL;
-    
-    PostMessage( WM_OUTPUT_MSG,THREADEND,0 );
-}
-
-void CRadCaliDlg::OnTaskOver( UINT tskId )
-{
-    int tskSum = m_listCtrl.GetItemCount();
-    for ( int i=0;i<tskSum;i++ ){
-        if ( int(tskId)==atoi(m_listCtrl.GetItemText(i,TSK_ID)) ){
-            m_listCtrl.SetItemText( i,TSK_STA,TSK_STA_OVER );
-        }
-    } 
-}
-
-void CRadCaliDlg::OnTaskTerm( UINT tskGrpId,UINT tskId )
-{
-    int tskSum = m_listCtrl.GetItemCount();
-    for ( int i=0;i<tskSum;i++ ){
-        if ( int(tskGrpId)==atoi(m_listCtrl.GetItemText(i,TSK_GRP)) && 
-            int(tskId)==atoi(m_listCtrl.GetItemText(i,TSK_ID)) ){
-            m_listCtrl.SetItemText( i,TSK_STA,TSK_STA_TERM );
-        }
-    }       
-}
-
-void CRadCaliDlg::OnTaskExit( UINT tskGrpId,UINT tskId )
-{
-    int tskSum = m_listCtrl.GetItemCount();
-    for ( int i=0;i<tskSum;i++ ){
-        if ( int(tskGrpId)==atoi(m_listCtrl.GetItemText(i,TSK_GRP)) && 
-            int(tskId)==atoi(m_listCtrl.GetItemText(i,TSK_ID)) ){
-            
-            cprintf( "\n\n========================== %s\n",m_listCtrl.GetItemText(i,TSK_STA) );
-            if ( m_listCtrl.GetItemText(i,TSK_STA)!=TSK_STA_OVER )            
-                m_listCtrl.SetItemText( i,TSK_STA,TSK_STA_EXIT );
-        }
-    }               
-}
-
-
-
-/*======================================================================
- *  TIFF 影像仿射变换封装与匹配实现
- *
- *  坐标约定（GDAL GeoTransform 6参数，像元左上角坐标）：
- *    gt[0]  = 左上角像元左上角 X（经度或 UTM Easting）
- *    gt[1]  = 每列的 X 增量（正数）
- *    gt[2]  = 行旋转项（通常为 0）
- *    gt[3]  = 左上角像元左上角 Y（纬度或 UTM Northing）
- *    gt[4]  = 列旋转项（通常为 0）
- *    gt[5]  = 每行的 Y 增量（正北向影像为负数）
- *
- *  像元中心坐标（与原 tfw 约定一致，因此公式等价）：
- *    X(col,row) = (gt[0]+gt[1]*0.5) + gt[1]*col + gt[2]*row
- *    Y(col,row) = (gt[3]+gt[5]*0.5) + gt[4]*col + gt[5]*row
- *  即 Ex = gt[0]+gt[1]*0.5，Dx = gt[1]，Ry = gt[2]
- *     Ny = gt[3]+gt[5]*0.5，Rx = gt[4]，Dy = gt[5]
- *
- *  逆变换（地理→像素中心）：
- *    det = Dx*Dy - Ry*Rx
- *    col = ( Dy*(X-Ex) - Ry*(Y-Ny) ) / det
- *    row = ( Dx*(Y-Ny) - Rx*(X-Ex) ) / det
- *
- *  内存布局：BIP，uint16，行 0 = 影像顶行，与 GDAL RasterIO 一致。
- *  OLP 坐标：直接存顶→下像素坐标，row=0 = 影像顶行，不翻转。
- *======================================================================*/
-
 
 /*======================================================================
  *  CLasHeightGrid
@@ -2417,228 +2174,13 @@ static void SaveMatchPlot(const CTifAffine& domImg, const CTifAffine& refImg,
     GDALClose(mem);
 }
 
-static bool IsGoodTiePoint(const OBV& pt) {
-    // 检测1：灰度合理性检测（排除过暗/过亮点）
-    double meanGray1 = (pt.cv[0] + pt.cv[1] + pt.cv[2] + pt.cv[3]) / 4.0;
-    double meanGray2 = (pt.rv[0] + pt.rv[1] + pt.rv[2] + pt.rv[3]) / 4.0;
-
-    // 排除过暗点（深阴影，DN<500）
-    if (meanGray1 < 500 || meanGray2 < 500) {
-        return false;
-    }
-
-    // 排除过曝点（DN>60000）
-    if (meanGray1 > 60000 || meanGray2 > 60000) {
-        return false;
-    }
-
-    // 检测2：极端差异（一个在阴影一个不在）
-    // 如果一个点很暗(<1000) 另一个很亮(>5000)，可能一个在阴影
-    if ((meanGray1 < 1000 && meanGray2 > 5000) ||
-        (meanGray2 < 1000 && meanGray1 > 5000)) {
-        return false;
-    }
-
-    // 检测3：NDVI一致性（防止地物类型混淆）
-    // 计算两个点的NDVI，如果差异很大可能是不同地物
-    double sumNIR_RED_1 = pt.cv[3] + pt.cv[2];
-    double sumNIR_RED_2 = pt.rv[3] + pt.rv[2];
-
-    if (sumNIR_RED_1 > 10 && sumNIR_RED_2 > 10) {
-        double ndvi1 = (double)(pt.cv[3] - pt.cv[2]) / sumNIR_RED_1;
-        double ndvi2 = (double)(pt.rv[3] - pt.rv[2]) / sumNIR_RED_2;
-
-        // NDVI差异过大（>0.4）可能是不同地物
-        // 例如：一个是植被(NDVI>0.5)，一个是建筑(NDVI<0.2)
-        if (fabs(ndvi1 - ndvi2) > 0.4) {
-            return false;
-        }
-    }
-
-    // 检测4：太阳角度一致性
-    // 太阳天顶角差异过大，可能一个在阴影区
-    double dsz = fabs(pt.csz - pt.rsz);
-    if (dsz > 30.0) {  // 天顶角差异超过30度
-        return false;
-    }
-
-    // 检测5：灰度标准差检测（排除噪声点）
-    // 计算4个波段的标准差，如果太小说明可能是噪声或无纹理区域
-    double std1 = 0, std2 = 0;
-    double mean1 = meanGray1, mean2 = meanGray2;
-
-    for (int b = 0; b < 4; b++) {
-        std1 += (pt.cv[b] - mean1) * (pt.cv[b] - mean1);
-        std2 += (pt.rv[b] - mean2) * (pt.rv[b] - mean2);
-    }
-    std1 = sqrt(std1 / 4.0);
-    std2 = sqrt(std2 / 4.0);
-
-    // 标准差太小（<50）说明灰度变化很小，可能是无纹理区域
-    if (std1 < 50 || std2 < 50) {
-        return false;
-    }
-
-    // 检测6：波段比例一致性
-    // 检查R/G, NIR/R等比例是否一致
-    if (pt.cv[1] > 100 && pt.rv[1] > 100) {  // G波段不为0
-        double ratio1_RG = pt.cv[2] / pt.cv[1];  // R/G比例
-        double ratio2_RG = pt.rv[2] / pt.rv[1];
-
-        // 比例差异过大
-        if (fabs(ratio1_RG - ratio2_RG) / (ratio1_RG + 0.001) > 0.5) {
-            return false;
-        }
-    }
-
-    return true;
-}
-
-// ==================== 进阶版：分层质量评估 ====================
-// 不仅判断好坏，还给出质量等级
-enum TiePointQuality {
-    QUALITY_EXCELLENT = 0,  // 优秀（平坦地面、道路等）
-    QUALITY_GOOD = 1,       // 良好（一般地物）
-    QUALITY_FAIR = 2,       // 一般（建筑顶部、植被）
-    QUALITY_POOR = 3,       // 较差（阴影边缘、高度变化区）
-    QUALITY_BAD = 4         // 差（应该过滤）
-};
-
-// isAbsolute=true : cv[]为航空DN，rv[]为哨兵DN（绝对约束配对）
-// isAbsolute=false: cv[]和rv[]均为航空DN（相对约束配对）
-static TiePointQuality EvaluateTiePointQuality(const OBV& pt, bool isAbsolute) {
-
-    double meanCv = (pt.cv[0] + pt.cv[1] + pt.cv[2] + pt.cv[3]) / 4.0; // 航空侧
-    double meanRv = (pt.rv[0] + pt.rv[1] + pt.rv[2] + pt.rv[3]) / 4.0; // 参考侧
-
-    if (isAbsolute) {
-        // ── 绝对约束：cv=航空，rv=哨兵(0~10000) ──
-        // 哨兵DN阈值（反射率单位×10000）
-        const double S_MIN = 80.0;   // ~反射率0.008，极暗/无效像元
-        const double S_MAX = 9500.0;  // 接近饱和
-        const double S_SHADOW = 400.0;   // ~反射率0.04，哨兵侧阴影上限
-        const double S_DARK = 800.0;   // ~反射率0.08，偏暗
-        const double S_BRIGHT = 1200.0;  // ~反射率0.12，中等亮度起点
-
-        // 航空DN阈值（16bit）
-        const double A_MIN = 500.0;  // 极暗像元
-        const double A_SHADOW = 500.0;  // 航空侧阴影上限
-        const double A_BRIGHT = 5000.0;  // 中等亮度起点
-
-        // 基本过滤
-        //if (meanRv < S_MIN || meanRv > S_MAX) return QUALITY_BAD;
-        //if (meanCv < A_MIN || meanCv > 62000) return QUALITY_BAD;
-
-        // NDVI：两端都在各自归一化空间内计算，比值是单位无关量
-        double ndvi_aerial = 0.0, ndvi_sentinel = 0.0;
-        float cv3 = pt.cv[3], cv2 = pt.cv[2];
-        float rv3 = pt.rv[3], rv2 = pt.rv[2];
-        if (cv3 + cv2 > 10.0f)
-            ndvi_aerial = (cv3 - cv2) / (cv3 + cv2);
-        if (rv3 + rv2 > 1.0f)
-            ndvi_sentinel = (rv3 - rv2) / (rv3 + rv2);
-        double ndviDiff = fabs(ndvi_aerial - ndvi_sentinel);
-
-        // NDVI差异过大：地物类型不一致（可能时相差异或配准误差）
-        if (ndviDiff > 0.35) return QUALITY_BAD;
-
-        // 阴影区
-        //if (meanCv < A_SHADOW || meanRv < S_SHADOW) return QUALITY_POOR;
-
-        // 偏暗区
-        //if (meanCv < A_BRIGHT || meanRv < S_DARK) return QUALITY_FAIR;
-
-        // 中等及以上亮度，NDVI一致性判等级
-        if (ndviDiff < 0.10) {
-            // 低NDVI（道路/裸土/建筑）：辐射约束最可靠
-            if (fabs(ndvi_aerial) < 0.20 && fabs(ndvi_sentinel) < 0.20)
-                return QUALITY_EXCELLENT;
-            return QUALITY_GOOD;
-        }
-        if (ndviDiff < 0.20) return QUALITY_GOOD;
-        return QUALITY_FAIR;
-    }
-    else {
-        // ── 相对约束：cv和rv均为航空DN ──
-        const double A_MIN = 500.0;
-        const double A_SAT = 62000.0;
-        const double A_SHADOW = 500.0;
-        const double A_BRIGHT = 5000.0;
-
-        //if (meanCv < A_MIN || meanRv < A_MIN) return QUALITY_BAD;
-        //if (meanCv > A_SAT || meanRv > A_SAT) return QUALITY_BAD;
-
-        // 一侧极暗一侧正常：极可能是阴影边界伪匹配
-        //if ((meanCv < 1000 && meanRv > 8000) ||
-        //    (meanRv < 1000 && meanCv > 8000)) return QUALITY_BAD;
-
-        double ndvi1 = 0.0, ndvi2 = 0.0;
-        if (pt.cv[3] + pt.cv[2] > 10.0f)
-            ndvi1 = (pt.cv[3] - pt.cv[2]) / (pt.cv[3] + pt.cv[2]);
-        if (pt.rv[3] + pt.rv[2] > 10.0f)
-            ndvi2 = (pt.rv[3] - pt.rv[2]) / (pt.rv[3] + pt.rv[2]);
-        double ndviDiff = fabs(ndvi1 - ndvi2);
-
-        if (ndviDiff > 0.40) return QUALITY_BAD;
-
-        //if (meanCv < A_SHADOW || meanRv < A_SHADOW) return QUALITY_POOR;
-        //if (meanCv < A_BRIGHT || meanRv < A_BRIGHT) return QUALITY_FAIR;
-
-        if (ndviDiff < 0.10) {
-            if (fabs(ndvi1) < 0.20 && fabs(ndvi2) < 0.20)
-                return QUALITY_EXCELLENT;
-            return QUALITY_GOOD;
-        }
-        if (ndviDiff < 0.20) return QUALITY_GOOD;
-        if (ndvi1 > 0.30 || ndvi2 > 0.30) return QUALITY_FAIR;
-        return QUALITY_FAIR;
-    }
-}
-
-// 根据质量等级返回权重系数
-static double GetQualityWeight(TiePointQuality quality) {
-    switch (quality) {
-    case QUALITY_EXCELLENT: return 1.0;   // 优秀
-    case QUALITY_GOOD:      return 0.9;   // 良好
-    case QUALITY_FAIR:      return 0.7;   // 一般
-    case QUALITY_POOR:      return 0.4;   // 较差
-    case QUALITY_BAD:       return 0.0;   // 差（过滤）
-    default:                return 0.5;
-    }
-}
-/*----------------------------------------------------------------------
- *  匹配点质量统计（每对影像）
- *  在MchTie末尾调用，将各质量等级计数写入 .olpstat 文本文件，
- *  供后续可视化或日志分析使用。
- *----------------------------------------------------------------------*/
-static void SaveOlpQualityStat(
-    const char* strOlpBase,     // 原始.olp路径（用于构造.olpstat路径）
-    bool isAbsolute,            // 是否为绝对约束对（哨兵配对）
-    int nExcellent, int nGood, int nFair, int nPoor, int nBad,
-    double meanCv, double meanRv)
-{
-    char statPath[512];
-    strcpy(statPath, strOlpBase);
-    char* p = strrchr(statPath, '.'); if (p) strcpy(p, ".olpstat");
-    FILE* f = fopen(statPath, "wt"); if (!f) return;
-    int total = nExcellent + nGood + nFair + nPoor + nBad;
-    fprintf(f, "type=%s\n", isAbsolute ? "absolute(sentinel)" : "relative(aerial)");
-    fprintf(f, "total=%d excellent=%d good=%d fair=%d poor=%d bad=%d\n",
-        total, nExcellent, nGood, nFair, nPoor, nBad);
-    fprintf(f, "meanDN_src=%.1f meanDN_ref=%.1f\n", meanCv, meanRv);
-    if (total > 0)
-        fprintf(f, "excellent_pct=%.1f good_pct=%.1f fair_pct=%.1f poor_pct=%.1f bad_pct=%.1f\n",
-            100.0 * nExcellent / total, 100.0 * nGood / total, 100.0 * nFair / total,
-            100.0 * nPoor / total, 100.0 * nBad / total);
-    fclose(f);
-}
 /*----------------------------------------------------------------------
  *  并行匹配结果记录
  *----------------------------------------------------------------------*/
 struct MatchRec {
     int cxDom, cyDom;   // 主影像像素（顶→下）
     int cxRef, cyRef;   // 参考影像像素（顶→下）
-    float cv[8], rv[8];  // 主/参考各波段（最多8波段）
+    WORD cv[8], rv[8];  // 主/参考各波段（最多8波段）
     double sz, vz, as;
     double sz1, vz1, as1;
 };
@@ -2646,9 +2188,7 @@ struct MatchRec {
 /////////////////////////////////////////////////////////////////////////////
 BOOL MchTie(LPCSTR lpstrPar)
 {
-    char strSrc[512], strRef[512], strTsk[512], str[1024];
-    char strOlp[512] = {}, strOlpExcellent[512] = {}, strOlpGood[512] = {},
-        strOlpFair[512] = {}, strOlpPoor[512] = {};
+    char strSrc[512], strRef[512], strTsk[512], str[1024], strOlp[512];
     double cx, cy, cz, phi, img_, kap, grdZ;
     double cx1, cy1, cz1, phi1, img1, kap1, grdZ1;
     int idx, yy, mm, dd, ho, mi, se, yy1, mm1, dd1, ho1, mi1, se1;
@@ -2719,33 +2259,32 @@ BOOL MchTie(LPCSTR lpstrPar)
     geoCvt.Set_Cvt_Par(ET_WGS84, UTM_PROJECTION, SEMIMAJOR_WGS84, SEMIMINOR_WGS84, 0, Zone2CenterMerdian(utmZn) * SPGC_D2R, 500000, 0, 0.9996, 0);
 
     // ── 计算 avK1 / avK2（遍历像元，步长 step）──
-    {
-        char strKM[512]; strcpy(strKM, strTsk); strcat(strKM, "_skm.txt");
-        FILE* fKM = fopen(strKM, "wt");
-        if (fKM) {
-            double avK1 = 0, avK2 = 0, ks = 0;
-            double sz, vz, as, gx, gy,gz;
-            for (int r = 1; r < domImg.rows - step; r += step) {
-                for (int c = 1; c < domImg.cols - step; c += step) {
-                    if (CTifAffine::IsBlack(domImg.PixPtr(c, r), domImg.bands)) continue;
-                    domImg.Pix2Geo(c, r, gx, gy);
-                    double ptZ0 = grdZ; if (bHasLas) lasGrid.GetZ(gx, gy, ptZ0);
-                    double lon, lat, hei;
-                    gz = ptZ0;
-                    geoCvt.Cvt_Prj2LBH(gx, gy, gz, &lon, &lat, &hei);
-                    getSunPos(gx, gy, gz, cx, cy, cz, lon * SPGC_R2D, lat * SPGC_R2D, yy, mm, dd, ho, mi, se, &sz, &vz, &as);
-                    avK1 += getKval(1, sz, vz, as); avK2 += getKval(4, sz, vz, as); ks += 1;
-                }
-            }
-            if (ks > 0) { avK1 /= ks; avK2 /= ks; }
-            cprintf("avK1=%lf avK2=%lf\n", avK1, avK2);
-            fprintf(fKM, "%lf %lf\n", avK1, avK2); fclose(fKM);
-        }
-    }
+    //{
+    //    char strKM[512]; strcpy(strKM, strTsk); strcat(strKM, "_skm.txt");
+    //    FILE* fKM = fopen(strKM, "wt");
+    //    if (fKM) {
+    //        double avK1 = 0, avK2 = 0, ks = 0;
+    //        double sz, vz, as, gx, gy,gz;
+    //        for (int r = 1; r < domImg.rows - step; r += step) {
+    //            for (int c = 1; c < domImg.cols - step; c += step) {
+    //                if (CTifAffine::IsBlack(domImg.PixPtr(c, r), domImg.bands)) continue;
+    //                domImg.Pix2Geo(c, r, gx, gy);
+    //                double ptZ0 = grdZ; if (bHasLas) lasGrid.GetZ(gx, gy, ptZ0);
+    //                double lon, lat, hei;
+    //                gz = ptZ0;
+    //                geoCvt.Cvt_Prj2LBH(gx, gy, gz, &lon, &lat, &hei);
+    //                getSunPos(gx, gy, gz, cx, cy, cz, lon * SPGC_R2D, lat * SPGC_R2D, yy, mm, dd, ho, mi, se, &sz, &vz, &as);
+    //                avK1 += getKval(1, sz, vz, as); avK2 += getKval(4, sz, vz, as); ks += 1;
+    //            }
+    //        }
+    //        if (ks > 0) { avK1 /= ks; avK2 /= ks; }
+    //        cprintf("avK1=%lf avK2=%lf\n", avK1, avK2);
+    //        fprintf(fKM, "%lf %lf\n", avK1, avK2); fclose(fKM);
+    //    }
+    //}
 
     // ── 逐参考影像匹配 ──
     COlpFile olpF;
-    COlpFile olpExcellent, olpGood, olpFair, olpPoor;
     while (!feof(fTsk)) {
         if (!fgets(str, sizeof(str), fTsk)) break;
         sscanf(str, "%s", strRef); DOS_PATH(strRef);
@@ -2758,26 +2297,19 @@ BOOL MchTie(LPCSTR lpstrPar)
         strcpy(strOlp, strTsk); strcpy(strrchr(strOlp, '.'), "_");
         strcat(strOlp, strrchr(strRef, '\\') + 1); strcat(strOlp, ".olp");
         cprintf("%s\n", strOlp);
-        strcpy(strOlpExcellent, strOlp); char* p = strrchr(strOlpExcellent, '.'); if (p) strcpy(p, "_excellent.olp");
-        strcpy(strOlpGood, strOlp); p = strrchr(strOlpGood, '.'); if (p) strcpy(p, "_good.olp");
-        strcpy(strOlpFair, strOlp); p = strrchr(strOlpFair, '.'); if (p) strcpy(p, "_fair.olp");
-        strcpy(strOlpPoor, strOlp); p = strrchr(strOlpPoor, '.'); if (p) strcpy(p, "_poor.olp");
 
-    // 加载参考影像
+        // 加载参考影像
         CTifAffine refImg;
         if (!refImg.Load(strRef)) continue;
 
         char strPlot[512]; strcpy(strPlot, strOlp);
         { char* p = strrchr(strPlot, '.'); if (p) strcpy(p, ".png"); else strcat(strPlot, ".png"); }
 
-        int tieSum = 0, vSum = 0, cSum = 0, gSum = 0;
+        int tieSum = 0, vSum = 0, cSum = 0;
         const int rowsD = domImg.rows, rowsR = refImg.rows;
 
         olpF.SetSize(0);
-		olpExcellent.SetSize(0);
-		olpGood.SetSize(0);
-		olpFair.SetSize(0);
-		olpPoor.SetSize(0);
+
         // 粗/细分辨率判断
         double gsdD = domImg.GSD(), gsdR_ = refImg.GSD();
         bool domIsCoarse = (gsdD >= gsdR_);
@@ -2904,67 +2436,23 @@ BOOL MchTie(LPCSTR lpstrPar)
         } // end parallel
 
         // ── 写入 OLP（直接存顶→下像素坐标，不翻转）──
-        // idx==-1 表示参考影像为哨兵（绝对约束），rv[]为哨兵DN
-        bool isAbsolute = (idx == -1);
-        int nEx = 0, nGd = 0, nFr = 0, nPr = 0, nBd = 0;
-        double sumCv = 0, sumRv = 0;
-        for (auto& rec : allRecs) {
-            OBV pt = {
-                rec.cxDom, rec.cyDom, rec.cxRef, rec.cyRef,  // cc, cr, rc, rr
-                rec.cv[0], rec.cv[1], rec.cv[2], rec.cv[3],  // cv[0-3]
-                rec.rv[0], rec.rv[1], rec.rv[2], rec.rv[3],  // rv[0-3]
-                (float)rec.sz, (float)rec.vz, (float)rec.as, // csz, cvz, cas
-                (float)rec.sz1, (float)rec.vz1, (float)rec.as1 // rsz, rvz, ras
-            };
-
-            TiePointQuality quality = EvaluateTiePointQuality(pt, isAbsolute);
-
-            switch (quality) {
-            case QUALITY_EXCELLENT: olpExcellent.Append(pt); nEx++; break;
-            case QUALITY_GOOD:      olpGood.Append(pt);      nGd++; break;
-            case QUALITY_FAIR:      olpFair.Append(pt);      nFr++; break;
-            case QUALITY_POOR:      olpPoor.Append(pt);      nPr++; break;
-            case QUALITY_BAD:       nBd++; break;
-            default: break;
-            }
-            //if (!IsGoodTiePoint(pt)) {
-            //    gSum++;
-            //    continue;  // 跳过低质量点
-            //}
-            olpF.Append(pt);
+        for (const auto& rec : allRecs) {
+            olpF.Append(rec.sz, rec.vz, rec.as,
+                rec.cxDom, rec.cyDom, rec.cv,
+                rec.sz1, rec.vz1, rec.as1,
+                rec.cxRef, rec.cyRef, rec.rv);
         }
         tieSum = int(allRecs.size());
-        double meanCvStat = (tieSum > 0) ? sumCv / tieSum : 0;
-        double meanRvStat = (tieSum > 0) ? sumRv / tieSum : 0;
-        // 统计日志：区分绝对约束（哨兵）和相对约束（航空-航空）
-        print2Log("%s pair: total=%d Ex=%d(%.0f%%) Gd=%d(%.0f%%) Fr=%d(%.0f%%) Pr=%d(%.0f%%) Bad=%d "
-            "meanDN_src=%.0f meanDN_ref=%.0f step=%d\n",
-            isAbsolute ? "[ABS/Sentinel]" : "[REL/Aerial]",
-            tieSum,
-            nEx, tieSum > 0 ? 100.0 * nEx / tieSum : 0.0,
-            nGd, tieSum > 0 ? 100.0 * nGd / tieSum : 0.0,
-            nFr, tieSum > 0 ? 100.0 * nFr / tieSum : 0.0,
-            nPr, tieSum > 0 ? 100.0 * nPr / tieSum : 0.0,
-            nBd, meanCvStat, meanRvStat, step);
+        print2Log("tieSum=%d step=%d verifyR=%d thr=%.2f skip(black)=%d skip(zncc)=%d\n",
+            tieSum, step, (std::max)(3, RAD_PATCH_RADIUS), RAD_MIN_ZNCC, vSum, cSum);
 
-        // 保存每对的统计文件（.olpstat），供后续分析
-        SaveOlpQualityStat(strOlp, isAbsolute, nEx, nGd, nFr, nPr, nBd, meanCvStat, meanRvStat);
-
-        if (nEx + nGd + nFr + nPr > 0) {
+        if (olpF.GetSize() > 0) {
             if (bTxt) {
-                //char strTxt[512]; strcpy(strTxt, strOlp); strcat(strTxt, ".txt");
-                olpF.Save2File(strOlp, FALSE);
-				olpExcellent.Save2File(strOlpExcellent, FALSE);
-				olpGood.Save2File(strOlpGood, FALSE);
-				olpFair.Save2File(strOlpFair, FALSE);
-				olpPoor.Save2File(strOlpPoor, FALSE);
+                char strTxt[512]; strcpy(strTxt, strOlp); strcat(strTxt, ".txt");
+                olpF.Save2File(strTxt, FALSE);
             }
             else {
                 olpF.Save2File(strOlp);
-				olpExcellent.Save2File(strOlpExcellent);
-				olpGood.Save2File(strOlpGood);
-				olpFair.Save2File(strOlpFair);
-				olpPoor.Save2File(strOlpPoor);
             }
             //SaveMatchPlot(domImg, refImg, olpF, strPlot);
         }
